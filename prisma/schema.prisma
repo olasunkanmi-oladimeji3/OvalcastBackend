@@ -1,0 +1,1086 @@
+// Ovalcast database schema. Relationships and anything filtered on are real
+// columns with indexes; nested value objects that are always read and written
+// whole (playing conditions, player rules, stages, staff) are Json (jsonb).
+// Their TypeScript shapes live in mobile/src/api/types.ts.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ------------------------------------------------------------------ accounts
+
+model User {
+  id              String    @id
+  name            String
+  /// Stored lower-case.
+  email           String?   @unique
+  /// International form, such as +2348025550199.
+  phone           String?   @unique
+  emailVerified   Boolean   @default(false) @map("email_verified")
+  phoneVerified   Boolean   @default(false) @map("phone_verified")
+  passwordHash    String    @map("password_hash")
+  city            String?
+  /// Where they play: sets currency, prices, time zone and payment methods (engine/countries).
+  country         String?
+  /// How they play: { role, battingHand, bowlingStyle }, set by themselves.
+  playing         Json?
+  playerId        String?   @map("player_id")
+  /// UserSettings
+  settings        Json
+  /// OfficiatingProfile without certificates
+  officiating     Json?
+  /// Ovalcast's own operations staff. Never a client role.
+  staff           Boolean   @default(false)
+  /// Overrides the platform share on streams this person hosts. Null: their organisation's, or the global setting.
+  platformShare   Float?    @map("platform_share")
+  /// { teamIds, playerIds, competitionIds } this user follows.
+  follows         Json      @default("{}")
+  /// Set when the user asks for their account to be deleted; it is removed on this date.
+  deleteOn        DateTime? @map("delete_on") @db.Timestamptz
+  failedLogins    Int       @default(0) @map("failed_logins")
+  lockedUntil     DateTime? @map("locked_until") @db.Timestamptz
+  /// Set by Ovalcast staff: the account can't sign in and its sessions are ended.
+  suspendedAt     DateTime? @map("suspended_at") @db.Timestamptz
+  suspendedReason String?   @map("suspended_reason")
+  /// The last signed-in request, written at most every few minutes.
+  lastSeenAt      DateTime? @map("last_seen_at") @db.Timestamptz
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  memberships     Membership[]
+  sessions        Session[]
+  certificates    Certificate[]
+  notifications   Notification[]
+  officialInvites OfficialInvite[]
+  subscriptions   Subscription[]
+  wallet          Wallet?
+  passes          MatchPass[]
+
+  // The backoffice lists accounts newest first and filters on these; the jobs find accounts due for deletion.
+  @@index([createdAt])
+  @@index([lastSeenAt])
+  @@index([playerId])
+  @@index([suspendedAt])
+  @@index([lockedUntil])
+  @@index([deleteOn])
+  // Searching by any part of a name, email or phone number (pg_trgm).
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "users_name_trgm_idx")
+  @@index([email(ops: raw("gin_trgm_ops"))], type: Gin, map: "users_email_trgm_idx")
+  @@index([phone(ops: raw("gin_trgm_ops"))], type: Gin, map: "users_phone_trgm_idx")
+  // Who follows a club or league, when its result goes out: follows @> {"teamIds":[id]}.
+  @@index([follows(ops: JsonbPathOps)], type: Gin)
+  @@map("users")
+}
+
+model Membership {
+  id     String  @id
+  userId String  @map("user_id")
+  orgId  String? @map("org_id")
+  clubId String? @map("club_id")
+  /// owner | leagueAdmin | scorer | clubAdmin | player
+  role   String
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([orgId, role])
+  @@index([clubId, role])
+  @@map("memberships")
+}
+
+/// Bearer sessions. Only a SHA-256 of the token is stored.
+model Session {
+  tokenHash String    @id @map("token_hash")
+  userId    String    @map("user_id")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([createdAt])
+  @@map("sessions")
+}
+
+/// One-time codes for verifying an email or phone, or resetting a password. Only a hash is stored.
+model VerificationCode {
+  identifier String
+  /// verify | reset
+  purpose    String
+  codeHash   String   @map("code_hash")
+  attempts   Int      @default(0)
+  sentAt     DateTime @map("sent_at") @db.Timestamptz
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz
+  /// For "add a contact": the signed-in user it will be attached to.
+  userId     String?  @map("user_id")
+
+  @@id([identifier, purpose])
+  @@map("verification_codes")
+}
+
+// ------------------------------------------------------------- organisations
+
+model Region {
+  id      String @id
+  name    String
+  country String
+  lat     Float
+  lon     Float
+  /// string[]
+  cities  Json
+
+  @@map("regions")
+}
+
+model Organisation {
+  id                String    @id
+  name              String
+  shortName         String    @map("short_name")
+  city              String
+  country           String
+  /// NGN | GHS | SLE | GMD
+  currency          String
+  /// Overrides the platform share on streams of this organisation's matches. Null: the global setting.
+  platformShare     Float?    @map("platform_share")
+  /// Overrides Ovalcast's share of this organisation's entry fees. Null: the global setting.
+  entryShare        Float?    @map("entry_share")
+  about             String    @default("")
+  founded           Int
+  executives        Json      @default("[]")
+  sponsors          Json      @default("[]")
+  honours           Json      @default("[]")
+  seasonMoves       Json      @default("[]") @map("season_moves")
+  /// organisation (by contract) | free; without a contract, leagues use their admins' own plans.
+  plan              String    @default("free")
+  /// league | association | festival | school | academy | corporate
+  kind              String    @default("league")
+  logoUrl           String?   @map("logo_url")
+  coverUrl          String?   @map("cover_url")
+  brandColor        String?   @map("brand_color")
+  viewerHoursLeft   Int       @default(0) @map("viewer_hours_left")
+  viewerHoursUsed   Int       @default(0) @map("viewer_hours_used")
+  /// Website embeds (tables, fixtures, results, live scores in an iframe on the organisation's own site).
+  /// Off until Ovalcast staff approve them; then they show only on embedDomains.
+  embedsRequestedAt DateTime? @map("embeds_requested_at") @db.Timestamptz
+  embedsApprovedAt  DateTime? @map("embeds_approved_at") @db.Timestamptz
+  embedsApprovedBy  String?   @map("embeds_approved_by")
+  /// Hostnames such as ccclagos.com or *.ccclagos.com.
+  embedDomains      Json      @default("[]") @map("embed_domains")
+
+  teams         Team[]
+  competitions  Competition[]
+  payoutAccount PayoutAccount?
+  settlements   Settlement[]
+
+  @@map("organisations")
+}
+
+model Team {
+  id         String        @id
+  orgId      String?       @map("org_id")
+  name       String
+  shortName  String        @map("short_name")
+  /// [primary, secondary]
+  colors     Json
+  homeGround String        @map("home_ground")
+  city       String
+  founded    Int
+  logoUrl    String?       @map("logo_url")
+  /// StaffMember[]
+  staff      Json          @default("[]")
+  adHoc      Boolean       @default(false) @map("ad_hoc")
+  org        Organisation? @relation(fields: [orgId], references: [id])
+
+  players       Player[]
+  playerInvites PlayerInvite[]
+  entries       Entry[]
+  registrations Registration[]
+  deductions    Deduction[]
+  /// Practice sides pick from this club's squad.
+  parentTeamId  String?        @map("parent_team_id")
+
+  @@index([orgId])
+  @@index([city])
+  // A coach's clubs, found by staff @> [{userId, role}].
+  @@index([staff(ops: JsonbPathOps)], type: Gin)
+  @@map("teams")
+}
+
+model Player {
+  id           String  @id
+  teamId       String  @map("team_id")
+  name         String
+  shortName    String  @map("short_name")
+  /// batter | bowler | allRounder | keeper
+  role         String
+  /// R | L
+  battingHand  String  @map("batting_hand")
+  bowlingStyle String? @map("bowling_style")
+  guest        Boolean @default(false)
+  guestMatchId String? @map("guest_match_id")
+  team         Team    @relation(fields: [teamId], references: [id])
+
+  registrations   Registration[]
+  transfers       Transfer[]
+  /// Set when a club admin approves a user's claim to this typed-in or guest player.
+  claimedByUserId String?        @map("claimed_by_user_id")
+  /// Under 18: the public profile stays private without a guardian's consent.
+  minor           Boolean        @default(false)
+  guardianConsent Boolean        @default(false) @map("guardian_consent")
+  /// Never shown publicly: for age-limited rules (a second club for young players) and to mark under-18s.
+  dateOfBirth     DateTime?      @map("date_of_birth") @db.Date
+
+  @@index([teamId])
+  @@index([guestMatchId])
+  @@map("players")
+}
+
+model PlayerInvite {
+  id        String   @id
+  teamId    String   @map("team_id")
+  name      String
+  /// whatsapp | sms | email
+  channel   String
+  contact   String
+  /// pending | joined | cancelled
+  status    String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  team      Team     @relation(fields: [teamId], references: [id])
+
+  @@index([teamId])
+  @@map("player_invites")
+}
+
+// -------------------------------------------------------------- competitions
+
+model Competition {
+  id            String       @id
+  orgId         String       @map("org_id")
+  /// The same tournament across years: every edition (2025/26, 2026/27…) shares it. The first edition's id.
+  seriesId      String       @map("series_id")
+  name          String
+  season        String
+  division      String
+  format        String
+  ballType      String       @map("ball_type")
+  /// PlayingConditions
+  conditions    Json
+  points        Json
+  tieBreakers   Json         @map("tie_breakers")
+  /// Stage[]
+  stages        Json
+  /// string[]
+  teamIds       Json         @default("[]") @map("team_ids")
+  /// entries | inProgress | completed
+  status        String
+  entryPolicy   String       @map("entry_policy")
+  entryFee      Int          @default(0) @map("entry_fee")
+  maxTeams      Int          @map("max_teams")
+  startsOn      DateTime     @map("starts_on") @db.Timestamptz
+  /// PlayerRules
+  playerRules   Json         @map("player_rules")
+  rulesDocument Json?        @map("rules_document")
+  seasonRules   Json         @default("[]") @map("season_rules")
+  /// league | cup | festival | representative | schools | corporate
+  category      String       @default("league")
+  logoUrl       String?      @map("logo_url")
+  coverUrl      String?      @map("cover_url")
+  /// Division level in the organisation's season: 1 is the top.
+  tier          Int?
+  /// How a rain-shortened chase's target is set: arr (average run rate) or mpo (most productive overs).
+  rainRule      String       @default("arr") @map("rain_rule")
+  org           Organisation @relation(fields: [orgId], references: [id])
+
+  entries       Entry[]
+  registrations Registration[]
+  transfers     Transfer[]
+  deductions    Deduction[]
+  matches       Match[]
+
+  @@index([orgId])
+  @@index([status])
+  @@index([orgId, seriesId])
+  @@map("competitions")
+}
+
+model Entry {
+  id            String      @id
+  competitionId String      @map("competition_id")
+  teamId        String      @map("team_id")
+  /// invite | request
+  kind          String
+  /// pending | accepted | declined | withdrawn
+  status        String
+  message       String?
+  /// Payment
+  payment       Json?
+  createdAt     DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  respondedAt   DateTime?   @map("responded_at") @db.Timestamptz
+  competition   Competition @relation(fields: [competitionId], references: [id])
+  team          Team        @relation(fields: [teamId], references: [id])
+
+  @@index([competitionId])
+  @@index([teamId])
+  @@index([createdAt])
+  @@map("entries")
+}
+
+model Registration {
+  id            String      @id
+  competitionId String      @map("competition_id")
+  playerId      String      @map("player_id")
+  teamId        String      @map("team_id")
+  primary       Boolean
+  since         DateTime    @db.Timestamptz
+  /// active | ended
+  status        String
+  /// Leagues that approve squads: false until a league admin approves the player.
+  approved      Boolean     @default(true)
+  competition   Competition @relation(fields: [competitionId], references: [id])
+  player        Player      @relation(fields: [playerId], references: [id])
+  team          Team        @relation(fields: [teamId], references: [id])
+
+  @@index([competitionId])
+  @@index([playerId])
+  @@index([teamId])
+  @@map("registrations")
+}
+
+model Transfer {
+  id            String      @id
+  competitionId String      @map("competition_id")
+  playerId      String      @map("player_id")
+  fromTeamId    String      @map("from_team_id")
+  toTeamId      String      @map("to_team_id")
+  /// move | dual
+  kind          String
+  status        String
+  note          String?
+  history       Json
+  createdAt     DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  competition   Competition @relation(fields: [competitionId], references: [id])
+  player        Player      @relation(fields: [playerId], references: [id])
+
+  @@index([competitionId])
+  @@index([playerId])
+  @@map("transfers")
+}
+
+model Deduction {
+  id            String      @id
+  competitionId String      @map("competition_id")
+  teamId        String      @map("team_id")
+  points        Int
+  reason        String
+  note          String
+  matchId       String?     @map("match_id")
+  /// active | revoked
+  status        String
+  by            String
+  byName        String      @map("by_name")
+  at            DateTime    @db.Timestamptz
+  revokedAt     DateTime?   @map("revoked_at") @db.Timestamptz
+  competition   Competition @relation(fields: [competitionId], references: [id])
+  team          Team        @relation(fields: [teamId], references: [id])
+
+  @@index([competitionId])
+  @@map("deductions")
+}
+
+// ------------------------------------------------------------------- matches
+
+model Match {
+  id                 String       @id
+  competitionId      String?      @map("competition_id")
+  stageId            String?      @map("stage_id")
+  groupId            String?      @map("group_id")
+  title              String?
+  homeTeamId         String       @map("home_team_id")
+  awayTeamId         String       @map("away_team_id")
+  /// When scoring began; monthly match limits count from it.
+  startedAt          DateTime?    @map("started_at") @db.Timestamptz
+  /// The one phone allowed to score; set by the first ball, moved by a handover code.
+  scoringDeviceId    String?      @map("scoring_device_id")
+  /// Each side's captain and wicketkeeper: { [teamId]: { captainId, keeperId } }
+  leaders            Json?
+  /// A practice match inside one club; kept out of official records.
+  practice           Boolean      @default(false)
+  playerOfMatchId    String?      @map("player_of_match_id")
+  outcomeNote        String?      @map("outcome_note")
+  /// Overs cut by rain, bad light or a late start: { reason, minutesLost, overs, target, rule, noResult, text, at }.
+  reduced            Json?
+  /// How it was decided when it wasn't played out: postponed, cancelled, walkover, conceded, awarded and the rest (engine/decisions).
+  decision           Json?
+  venue              String
+  startsAt           DateTime     @map("starts_at") @db.Timestamptz
+  status             String
+  toss               Json?
+  battingFirstTeamId String?      @map("batting_first_team_id")
+  playingXI          Json?        @map("playing_xi")
+  officials          Json
+  /// Calculated from ball events by the engine; kept for lists and tables.
+  scores             Json         @default("[]")
+  result             Json?
+  locked             Boolean      @default(false)
+  streamId           String?      @map("stream_id")
+  friendly           Boolean      @default(false)
+  conditions         Json?
+  round              String?
+  placeholders       Json?
+  winnerTo           Json?        @map("winner_to")
+  createdBy          String?      @map("created_by")
+  /// Denormalised from officials so "matches I score" is an index lookup.
+  scorerUserId       String?      @map("scorer_user_id")
+  competition        Competition? @relation(fields: [competitionId], references: [id])
+
+  ballEvents      BallEvent[]
+  tossSession     TossSession?
+  officialInvites OfficialInvite[]
+  streams         Stream[]
+  clips           Clip[]
+  passOffer       PassOffer?
+
+  @@index([competitionId])
+  @@index([groupId])
+  @@index([stageId])
+  @@index([status])
+  @@index([homeTeamId])
+  @@index([awayTeamId])
+  @@index([scorerUserId])
+  @@index([startsAt])
+  @@index([startedAt])
+  @@index([createdBy])
+  // Matches someone umpired or prepared: officials @> {"umpireUserIds":[id]}.
+  @@index([officials(ops: JsonbPathOps)], type: Gin)
+  @@map("matches")
+}
+
+/// The append-only ball log. Every score is calculated from these.
+model BallEvent {
+  id        String   @id
+  matchId   String   @map("match_id")
+  clientId  String   @map("client_id")
+  innings   Int
+  seq       Int
+  /// delivery | void
+  kind      String
+  /// The full event as the engine reads it.
+  event     Json
+  /// Copied from the event, so a player's matches are found by index instead of reading every ball.
+  strikerId String?  @map("striker_id")
+  bowlerId  String?  @map("bowler_id")
+  createdBy String   @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  match     Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  // Offline syncs retry: the same client id is stored once per match.
+  @@unique([matchId, clientId])
+  @@index([matchId, createdAt])
+  @@index([createdAt])
+  @@index([strikerId])
+  @@index([bowlerId])
+  @@map("ball_events")
+}
+
+model TossSession {
+  matchId      String    @id @map("match_id")
+  code         String
+  callerTeamId String    @map("caller_team_id")
+  call         String?
+  outcome      String?
+  wonByTeamId  String?   @map("won_by_team_id")
+  decision     String?
+  at           DateTime? @db.Timestamptz
+  match        Match     @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@map("toss_sessions")
+}
+
+model OfficialInvite {
+  id            String   @id
+  matchId       String   @map("match_id")
+  userId        String   @map("user_id")
+  userName      String   @map("user_name")
+  /// scorer | umpire
+  role          String
+  invitedBy     String   @map("invited_by")
+  invitedByName String   @map("invited_by_name")
+  /// pending | accepted | declined | withdrawn
+  status        String
+  note          String?
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  match         Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  user          User     @relation(fields: [userId], references: [id])
+
+  @@index([matchId])
+  @@index([userId, status])
+  @@map("official_invites")
+}
+
+model Stream {
+  id             String    @id
+  matchId        String    @map("match_id")
+  /// live | ended | scheduled
+  status         String
+  playbackUrl    String    @map("playback_url")
+  viewers        Int       @default(0)
+  latencySeconds Int       @map("latency_seconds")
+  /// phone | encoder
+  source         String
+  streamer       String
+  /// The video service's live input, which holds the ingest key.
+  liveInputId    String?   @map("live_input_id")
+  startedBy      String?   @map("started_by")
+  /// Seconds the picture reached viewers, and seconds it was down, from the host's phone or the video service.
+  liveSeconds    Int       @default(0) @map("live_seconds")
+  downSeconds    Int       @default(0) @map("down_seconds")
+  /// Set when passes were refunded because the stream was down for over 30% of it.
+  refundedAt     DateTime? @map("refunded_at") @db.Timestamptz
+  match          Match     @relation(fields: [matchId], references: [id])
+
+  @@index([matchId])
+  @@index([status])
+  @@map("streams")
+}
+
+model Clip {
+  id              String @id
+  matchId         String @map("match_id")
+  ballEventId     String @map("ball_event_id")
+  /// four | six | wicket
+  kind            String
+  title           String
+  over            String
+  durationSeconds Int    @map("duration_seconds")
+  match           Match  @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@index([matchId])
+  @@map("clips")
+}
+
+// ------------------------------------------------------ people and community
+
+model Certificate {
+  id         String   @id
+  userId     String   @map("user_id")
+  /// scorer | umpire | groundsman | coach
+  role       String
+  title      String
+  issuer     String
+  year       Int
+  fileName   String   @map("file_name")
+  /// Storage key; files are private and served only to their owner and league admins.
+  fileKey    String   @map("file_key")
+  /// pending | verified | rejected
+  status     String
+  uploadedAt DateTime @default(now()) @map("uploaded_at") @db.Timestamptz
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status, uploadedAt])
+  @@map("certificates")
+}
+
+model Notification {
+  id     String   @id
+  userId String   @map("user_id")
+  kind   String
+  title  String
+  body   String
+  /// Where tapping it goes: { pathname, params }
+  link   Json?
+  read   Boolean  @default(false)
+  at     DateTime @default(now()) @db.Timestamptz
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, at])
+  @@map("notifications")
+}
+
+model Post {
+  id         String    @id
+  kind       String
+  regionId   String    @map("region_id")
+  title      String
+  body       String
+  authorId   String?   @map("author_id")
+  authorName String    @map("author_name")
+  teamId     String?   @map("team_id")
+  whatsapp   String
+  when       DateTime? @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([regionId, createdAt])
+  @@map("posts")
+}
+
+/// Where a league's entry fees are settled. The full account number lives only
+/// with the payment provider, as a subaccount; Ovalcast keeps the last four digits.
+model PayoutAccount {
+  orgId           String       @id @map("org_id")
+  /// bank | mobileMoney
+  kind            String
+  institution     String
+  institutionCode String       @map("institution_code")
+  last4           String
+  accountName     String       @map("account_name")
+  /// flutterwave
+  provider        String
+  /// The provider's subaccount code, used to split each payment.
+  subaccountCode  String       @map("subaccount_code")
+  /// auto | weekly | manual
+  schedule        String
+  verifiedAt      DateTime     @map("verified_at") @db.Timestamptz
+  changedBy       String       @map("changed_by")
+  changedByName   String       @map("changed_by_name")
+  /// Payouts pause for 24 hours after the account changes.
+  holdUntil       DateTime?    @map("hold_until") @db.Timestamptz
+  org             Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@map("payout_accounts")
+}
+
+/// A payout from the provider into a league's account.
+model Settlement {
+  id           String       @id
+  orgId        String       @map("org_id")
+  amount       Int
+  currency     String
+  paymentCount Int          @map("payment_count")
+  /// processing | paid | failed
+  status       String
+  reference    String
+  accountLabel String       @map("account_label")
+  /// scheduled | withdrawal
+  kind         String
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  paidAt       DateTime?    @map("paid_at") @db.Timestamptz
+  org          Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, createdAt])
+  @@map("settlements")
+}
+
+/// Provider webhook events already handled, so a retried delivery is applied once.
+model WebhookEvent {
+  id         String   @id
+  provider   String
+  type       String
+  receivedAt DateTime @default(now()) @map("received_at") @db.Timestamptz
+
+  @@map("webhook_events")
+}
+
+// ------------------------------------------------------------ business model
+
+/// Pro subscriptions. Renewal is a Flutterwave payment plan; each charge extends `renewsAt`.
+model Subscription {
+  id                String   @id
+  userId            String   @map("user_id")
+  /// pro
+  plan              String
+  /// monthly | yearly
+  interval          String
+  /// active | pastDue | cancelled
+  status            String
+  /// NGN in Nigeria, USD elsewhere
+  currency          String
+  amount            Int
+  startedAt         DateTime @map("started_at") @db.Timestamptz
+  renewsAt          DateTime @map("renews_at") @db.Timestamptz
+  cancelAtPeriodEnd Boolean  @default(false) @map("cancel_at_period_end")
+  /// flutterwave | appStore | playStore
+  provider          String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([status, renewsAt])
+  @@map("subscriptions")
+}
+
+/// Every payment someone starts, under our reference (Flutterwave's tx_ref).
+/// Completed once, from the verified webhook or instantly in development.
+model Checkout {
+  id         String    @id
+  /// entry | pro | topUp | pass | credits
+  kind       String
+  userId     String    @map("user_id")
+  /// The entry, match, competition or organisation it pays for.
+  refId      String?   @map("ref_id")
+  amount     Int
+  currency   String
+  /// pending | paid | failed
+  status     String
+  /// What to apply on success, such as the Pro interval or a season pass.
+  meta       Json      @default("{}")
+  method     String
+  /// Flutterwave's transaction id, once paid.
+  providerId String?   @map("provider_id")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  paidAt     DateTime? @map("paid_at") @db.Timestamptz
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@index([status, paidAt])
+  @@map("checkouts")
+}
+
+/// A fan's naira wallet for match passes.
+model Wallet {
+  userId   String        @id @map("user_id")
+  balance  Int           @default(0)
+  /// The currency of the country the owner plays in, fixed at the first top-up or refund.
+  currency String?
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entries  WalletEntry[]
+
+  @@map("wallets")
+}
+
+model WalletEntry {
+  id        String   @id
+  userId    String   @map("user_id")
+  /// topUp | pass | refund
+  kind      String
+  /// Positive in, negative out.
+  amount    Int
+  note      String
+  reference String
+  at        DateTime @default(now()) @db.Timestamptz
+  wallet    Wallet   @relation(fields: [userId], references: [userId], onDelete: Cascade)
+
+  @@index([userId, at])
+  @@index([kind, at])
+  @@map("wallet_entries")
+}
+
+/// A paid stream: the host's price for a match.
+model PassOffer {
+  matchId    String  @id @map("match_id")
+  price      Int
+  currency   String
+  hostUserId String  @map("host_user_id")
+  hostName   String  @map("host_name")
+  /// Offer a season pass for the rest of the competition too.
+  season     Boolean @default(false)
+  match      Match   @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@map("pass_offers")
+}
+
+model MatchPass {
+  id            String   @id
+  userId        String   @map("user_id")
+  matchId       String?  @map("match_id")
+  competitionId String?  @map("competition_id")
+  price         Int
+  currency      String
+  /// wallet | card | bankTransfer | ussd | mobileMoney
+  paidWith      String   @map("paid_with")
+  /// active | refunded
+  status        String
+  /// One device at a time: the device currently holding the pass.
+  deviceId      String?  @map("device_id")
+  hostUserId    String   @map("host_user_id")
+  /// How the price was split when sold: the payment provider's fee and the host's share. Ovalcast keeps the rest.
+  fee           Int?
+  /// The platform share this sale used (0.25 = 25% of the price after the payment fee). Null on sales from before rates were recorded; past sales never change.
+  platformShare Float?   @map("platform_share")
+  hostShare     Int?     @map("host_share")
+  at            DateTime @default(now()) @db.Timestamptz
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([at])
+  @@index([hostUserId, at])
+  @@index([matchId, status])
+  @@map("match_passes")
+}
+
+/// A host's pass income per match, after payment fees.
+model PassSale {
+  matchId    String   @map("match_id")
+  hostUserId String   @map("host_user_id")
+  passes     Int
+  gross      Int
+  fees       Int
+  host       Int
+  /// The match's currency; a host is paid in it.
+  currency   String?
+  at         DateTime @default(now()) @db.Timestamptz
+
+  @@id([matchId, hostUserId])
+  @@index([hostUserId, at])
+  @@map("pass_sales")
+}
+
+/// Weekly host payouts, once the balance reaches the local minimum (₦5,000 or the same value).
+model HostPayout {
+  id        String   @id
+  userId    String   @map("user_id")
+  amount    Int
+  currency  String?
+  /// processing | paid
+  status    String
+  reference String
+  at        DateTime @default(now()) @db.Timestamptz
+
+  @@index([userId, at])
+  @@index([at])
+  @@map("host_payouts")
+}
+
+model ViewerCreditPurchase {
+  id        String   @id
+  orgId     String   @map("org_id")
+  hours     Int
+  price     Int
+  reference String
+  at        DateTime @default(now()) @db.Timestamptz
+
+  @@index([orgId])
+  @@index([at])
+  @@map("viewer_credit_purchases")
+}
+
+// ------------------------------------------------------------- PRD features
+
+/// A short-lived code that moves scoring to another phone. Stored hashed.
+model ScorerHandover {
+  matchId   String   @id @map("match_id")
+  codeHash  String   @map("code_hash")
+  fromUser  String   @map("from_user")
+  expiresAt DateTime @map("expires_at") @db.Timestamptz
+  attempts  Int      @default(0)
+
+  @@map("scorer_handovers")
+}
+
+model RuleDocument {
+  id             String   @id
+  competitionId  String   @map("competition_id")
+  version        Int
+  name           String
+  sizeKb         Int      @map("size_kb")
+  fileKey        String   @map("file_key")
+  uploadedBy     String   @map("uploaded_by")
+  uploadedByName String   @map("uploaded_by_name")
+  uploadedAt     DateTime @default(now()) @map("uploaded_at") @db.Timestamptz
+
+  @@unique([competitionId, version])
+  @@map("rule_documents")
+}
+
+/// A user claiming matches recorded under a typed-in or guest player. The club admin decides.
+model PlayerClaim {
+  id          String    @id
+  playerId    String    @map("player_id")
+  playerName  String    @map("player_name")
+  teamId      String    @map("team_id")
+  userId      String    @map("user_id")
+  userName    String    @map("user_name")
+  /// pending | approved | rejected
+  status      String
+  note        String?
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  respondedAt DateTime? @map("responded_at") @db.Timestamptz
+
+  @@index([teamId, status])
+  @@index([playerId])
+  @@map("player_claims")
+}
+
+/// A club's or organisation's YouTube stream key, encrypted at rest.
+model YouTubeKey {
+  ownerId   String   @id @map("owner_id")
+  /// organisation | team
+  ownerKind String   @map("owner_kind")
+  keyEnc    String   @map("key_enc")
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz
+
+  @@map("youtube_keys")
+}
+
+/// Partner API keys, issued by Ovalcast to Organisation-plan customers. Only a hash is kept.
+model ApiClient {
+  id                String           @id
+  orgId             String           @map("org_id")
+  name              String
+  keyHash           String           @unique @map("key_hash")
+  keyPrefix         String           @map("key_prefix")
+  sandbox           Boolean          @default(true)
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  lastUsedAt        DateTime?        @map("last_used_at") @db.Timestamptz
+  revokedAt         DateTime?        @map("revoked_at") @db.Timestamptz
+  usageMonth        String           @default("") @map("usage_month")
+  requestsThisMonth Int              @default(0) @map("requests_this_month")
+  webhooks          PartnerWebhook[]
+
+  @@index([orgId])
+  @@map("api_clients")
+}
+
+model PartnerWebhook {
+  id         String            @id
+  clientId   String            @map("client_id")
+  url        String
+  /// Signs each delivery: HMAC-SHA256 of "<timestamp>.<body>".
+  secret     String
+  events     Json
+  active     Boolean           @default(true)
+  createdAt  DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  client     ApiClient         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@map("partner_webhooks")
+}
+
+/// Each event sent to a partner, retried with backoff until delivered or given up.
+model WebhookDelivery {
+  id            String         @id
+  webhookId     String         @map("webhook_id")
+  event         String
+  payload       Json
+  /// pending | delivered | failed
+  status        String
+  attempts      Int            @default(0)
+  nextAttemptAt DateTime       @default(now()) @map("next_attempt_at") @db.Timestamptz
+  lastError     String?        @map("last_error")
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  deliveredAt   DateTime?      @map("delivered_at") @db.Timestamptz
+  webhook       PartnerWebhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
+  @@map("webhook_deliveries")
+}
+
+/// A club's XI for a match, with reserves, captain and wicketkeeper. The scorer starts from it.
+model TeamSheet {
+  matchId         String   @map("match_id")
+  teamId          String   @map("team_id")
+  playerIds       Json     @map("player_ids")
+  reserves        Json     @default("[]")
+  captainId       String?  @map("captain_id")
+  keeperId        String?  @map("keeper_id")
+  submittedBy     String   @map("submitted_by")
+  submittedByName String   @map("submitted_by_name")
+  submittedAt     DateTime @default(now()) @map("submitted_at") @db.Timestamptz
+
+  @@id([matchId, teamId])
+  @@map("team_sheets")
+}
+
+/// A club asking the league to move a fixture.
+model FixtureRequest {
+  id              String    @id
+  matchId         String    @map("match_id")
+  teamId          String    @map("team_id")
+  requestedBy     String    @map("requested_by")
+  requestedByName String    @map("requested_by_name")
+  startsAt        DateTime? @map("starts_at") @db.Timestamptz
+  venue           String?
+  note            String
+  /// pending | approved | declined
+  status          String
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([matchId])
+  @@map("fixture_requests")
+}
+
+/// A rating of an official's work by someone who was part of the match. One per rater, person, role and match.
+model Rating {
+  id        String   @id
+  userId    String   @map("user_id")
+  raterId   String   @map("rater_id")
+  raterName String   @map("rater_name")
+  /// scorer | umpire | groundsman | coach
+  role      String
+  matchId   String?  @map("match_id")
+  /// Aspect key to 1..5 (engine/ratings).
+  scores    Json
+  comment   String?
+  at        DateTime @default(now()) @db.Timestamptz
+
+  @@unique([userId, raterId, role, matchId])
+  @@index([userId, role])
+  @@index([raterId])
+  @@map("ratings")
+}
+
+/// Ovalcast-wide settings staff change from the console. One row per key; "featureAccess" decides which features need a paid plan.
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  updatedBy String?  @map("updated_by")
+
+  @@map("settings")
+}
+
+/// A story: a training session, a match highlight, matchday news or a milestone, with photos.
+model Story {
+  id            String   @id
+  authorId      String   @map("author_id")
+  authorName    String   @map("author_name")
+  /// highlight, training, matchday, news or milestone
+  kind          String
+  text          String
+  photoUrls     Json     @default("[]") @map("photo_urls")
+  teamId        String?  @map("team_id")
+  matchId       String?  @map("match_id")
+  competitionId String?  @map("competition_id")
+  likes         Int      @default(0)
+  comments      Int      @default(0)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([createdAt])
+  @@index([teamId, createdAt])
+  @@index([competitionId, createdAt])
+  @@index([authorId, createdAt])
+  @@index([matchId, createdAt])
+  @@map("stories")
+}
+
+model StoryLike {
+  storyId   String   @map("story_id")
+  userId    String   @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@id([storyId, userId])
+  @@map("story_likes")
+}
+
+model StoryComment {
+  id         String   @id
+  storyId    String   @map("story_id")
+  authorId   String   @map("author_id")
+  authorName String   @map("author_name")
+  text       String
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([storyId, createdAt])
+  @@map("story_comments")
+}
+
+/// What Ovalcast staff did from the backoffice: suspensions, sign-outs, plan changes, refunds.
+model StaffAction {
+  id         String   @id
+  staffId    String   @map("staff_id")
+  staffName  String   @map("staff_name")
+  /// suspend | unsuspend | signOut | unlock | setPlan | refund | featureAccess | reviewCertificate | issueApiKey
+  action     String
+  /// user | organisation | match | certificate | settings
+  targetKind String   @map("target_kind")
+  targetId   String?  @map("target_id")
+  note       String?
+  at         DateTime @default(now()) @db.Timestamptz
+
+  @@index([at])
+  @@index([targetKind, targetId])
+  @@index([staffId, at])
+  @@map("staff_actions")
+}
