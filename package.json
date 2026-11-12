@@ -17,8 +17,6 @@
     "api:issue": "tsx scripts/issue-api-key.ts",
     "jobs": "node scripts/build.mjs && node --enable-source-maps dist/jobs.js",
     "worker": "node --enable-source-maps dist/worker.js",
-    "loadtest": "tsx scripts/loadtest.ts",
-    "bench": "tsx scripts/bench.ts",
     "db:check": "tsx scripts/db-check.ts",
     "db:setup": "prisma migrate deploy && tsx scripts/db-check.ts"
   },
