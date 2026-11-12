@@ -6,7 +6,8 @@ services:
     runtime: node
     region: frankfurt
     plan: free # starter (or above) for production: free instances sleep when idle
-    buildCommand: npm ci && npx prisma generate && npm run build
+    # --include=dev: NODE_ENV=production would otherwise skip the build tools (esbuild, prisma).
+    buildCommand: npm ci --include=dev && npx prisma generate && npm run build
     # Migrations before the new version takes traffic, over DIRECT_DATABASE_URL (prisma.config.ts).
     preDeployCommand: npm run db:deploy
     startCommand: npm start
