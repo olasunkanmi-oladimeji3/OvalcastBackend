@@ -203,6 +203,7 @@ export const toTransfer = (t: P.Transfer): Transfer => ({
   note: t.note ?? undefined,
   createdAt: t.createdAt.toISOString(),
   history: json(t.history),
+  startedBy: json<Transfer['history']>(t.history)[0]?.by === 'player' ? 'player' : 'club',
 });
 
 export const toDeduction = (d: P.Deduction) => ({ ...d, matchId: d.matchId ?? undefined, at: d.at.toISOString(), revokedAt: iso(d.revokedAt) });

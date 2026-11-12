@@ -94,7 +94,7 @@ async function main() {
   );
   await insert(prisma.entry, demo.entries.map((e) => ({ ...e, message: e.message ?? null, payment: e.payment ?? null, respondedAt: e.respondedAt ?? null })));
   await insert(prisma.registration, demo.registrations);
-  await insert(prisma.transfer, demo.transfers.map((t) => ({ ...t, note: t.note ?? null })));
+  await insert(prisma.transfer, demo.transfers.map(({ startedBy: _, ...t }) => ({ ...t, note: t.note ?? null })));
   await insert(prisma.deduction, demo.deductions.map((d) => ({ ...d, matchId: d.matchId ?? null, revokedAt: d.revokedAt ?? null })));
   await insert(prisma.officialInvite, demo.officialInvites.map((i) => ({ ...i, note: i.note ?? null })));
   await insert(prisma.notification, demo.notifications.map((n) => ({ id: n.id, userId: n.userId, kind: n.kind, title: n.title, body: n.body, link: n.link ?? null, read: n.read, at: n.at })));

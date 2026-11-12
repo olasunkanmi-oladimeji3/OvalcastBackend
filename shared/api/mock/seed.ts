@@ -1940,7 +1940,8 @@ export function createSeed(now = new Date()): Db {
     }
   }
 
-  // Premier League transfer window is open: one move done, two waiting.
+  // Premier League transfer window is open: one move done, three waiting (one on Tunde, the
+  // signed-in demo player, to agree to).
   const pl = (team: string, n: number) =>
     players.find((p) => p.id === `team_${team}_p${n}`)!;
   const moved = pl("apapa", 12);
@@ -1955,8 +1956,10 @@ export function createSeed(now = new Date()): Db {
       kind: "move",
       status: "approved",
       createdAt: ago(3),
+      startedBy: "club",
       history: [
-        { status: "awaitingClub", at: ago(3), by: "requestingClub" },
+        { status: "awaitingPlayer", at: ago(3), by: "requestingClub" },
+        { status: "awaitingClub", at: ago(2.8), by: "player" },
         { status: "awaitingLeague", at: ago(2.5), by: "releasingClub" },
         { status: "approved", at: ago(2), by: "league" },
       ],
@@ -1971,8 +1974,10 @@ export function createSeed(now = new Date()): Db {
       status: "awaitingLeague",
       note: "Moving closer to Surulere for work.",
       createdAt: ago(1.5),
+      startedBy: "player",
       history: [
-        { status: "awaitingClub", at: ago(1.5), by: "requestingClub" },
+        { status: "awaitingNewClub", at: ago(1.5), by: "player" },
+        { status: "awaitingClub", at: ago(1.3), by: "requestingClub" },
         { status: "awaitingLeague", at: ago(1), by: "releasingClub" },
       ],
     },
@@ -1986,7 +1991,24 @@ export function createSeed(now = new Date()): Db {
       status: "awaitingClub",
       note: "Not getting games at Yaba, we can offer a regular place.",
       createdAt: ago(0.4),
-      history: [{ status: "awaitingClub", at: ago(0.4), by: "requestingClub" }],
+      startedBy: "club",
+      history: [
+        { status: "awaitingPlayer", at: ago(0.4), by: "requestingClub" },
+        { status: "awaitingClub", at: ago(0.3), by: "player", note: "Recorded by the league: signed form at training." },
+      ],
+    },
+    {
+      id: "tr_4",
+      competitionId: premierComp.id,
+      playerId: "player_me",
+      fromTeamId: "team_yaba",
+      toTeamId: "team_surulere",
+      kind: "move",
+      status: "awaitingPlayer",
+      note: "We need an all-rounder for the second half of the season.",
+      createdAt: ago(0.2),
+      startedBy: "club",
+      history: [{ status: "awaitingPlayer", at: ago(0.2), by: "requestingClub" }],
     },
   );
   const movedReg = db.registrations.find(

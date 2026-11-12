@@ -269,8 +269,9 @@ export interface Registration {
 
 /**
  * Moving a player during a transfer window, or adding a second club where the
- * league allows it (`dual`). The club that wants the player asks, the releasing
- * club agrees, then the league admin approves.
+ * league allows it (`dual`). Either the club that wants the player asks and the
+ * player agrees, or the player asks and that club accepts. Then the player's
+ * current club releases them and the league admin approves.
  */
 export interface Transfer {
   id: ID;
@@ -279,11 +280,14 @@ export interface Transfer {
   fromTeamId: ID;
   toTeamId: ID;
   kind: 'move' | 'dual';
-  /** `disputed`: the releasing club refused and the requesting club asked the league to decide. */
-  status: 'awaitingClub' | 'awaitingLeague' | 'disputed' | 'approved' | 'rejected' | 'withdrawn';
+  /** `disputed`: the releasing club refused and the requesting club (or the player) asked the league to decide. */
+  status: import('@/engine').TransferStatus;
   note?: string;
   createdAt: ISODate;
-  history: { status: Transfer['status']; at: ISODate; by: 'requestingClub' | 'releasingClub' | 'league'; note?: string }[];
+  /** Who asked first: the club that wants the player, or the player. */
+  startedBy: 'club' | 'player';
+  /** `player` entries recorded by a league admin (for a player not on Ovalcast) say so in the note. */
+  history: { status: Transfer['status']; at: ISODate; by: 'requestingClub' | 'releasingClub' | 'league' | 'player'; note?: string }[];
 }
 
 export type StageKind = 'roundRobin' | 'superStage' | 'playoff' | 'knockout';
@@ -1406,10 +1410,12 @@ export interface OvalcastApi {
   listRegistrations(params: { competitionId?: ID; playerId?: ID; teamId?: ID }): Promise<Registration[]>;
   // GET /transfers?competitionId=&playerId=
   listTransfers(params: { competitionId?: ID; playerId?: ID }): Promise<Transfer[]>;
-  // POST /transfers  (club admin of toTeamId asks for the player)
+  // POST /transfers  (the club admin of toTeamId asks for the player, or the player asks to join toTeamId)
   requestTransfer(input: { competitionId: ID; playerId: ID; fromTeamId: ID; toTeamId: ID; kind: Transfer['kind']; note?: string }): Promise<Transfer>;
-  // POST /transfers/:id/respond  (releasing club, then league admin; the requesting club may withdraw)
+  // POST /transfers/:id/respond  (the player or the club asked, then the releasing club, then the league admin; whoever asked may withdraw)
   respondToTransfer(transferId: ID, response: 'approve' | 'reject' | 'withdraw' | 'dispute', note?: string): Promise<Transfer>;
+  // POST /registrations/:id/end  (ends a second club: the player, either club, or a league admin)
+  endRegistration(registrationId: ID, note?: string): Promise<Registration>;
 
   // PATCH /me
   updateMe(patch: Partial<Pick<User, 'name' | 'phone' | 'city' | 'settings'>>): Promise<User>;

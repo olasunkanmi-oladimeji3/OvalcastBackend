@@ -3,8 +3,8 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import type { Competition, Leaderboards, Match, Payment, SeriesSummary, Standings } from '@/api/types';
-import { buildBracket, canTransfer, fitGroups, roundRobin, standings, tableResult } from '@/engine';
+import type { Competition, Leaderboards, Match, Payment, SeriesSummary, Standings, Transfer } from '@/api/types';
+import { buildBracket, canTransfer, fitGroups, roundRobin, standings, tableResult, transferOpen } from '@/engine';
 import { entryShareFor } from '~/lib/shares';
 import { prisma, toJson } from '~/db/client';
 import { requireUser } from '~/lib/auth';
@@ -360,40 +360,105 @@ export async function competitionRoutes(app: FastifyInstance) {
     return { c, regs: regRefs, verdict: canTransfer({ ...input, league: c, regs: regRefs, transfers: trs.filter((t) => t.id !== excludeId).map(toTransfer), excludePending: !!excludeId, playerBirthDate: born ? born.toISOString().slice(0, 10) : undefined, leagueStartsOn: new Date(c.startsOn).toISOString() }) };
   };
 
+  /** The user who is this player on Ovalcast, if they've joined. */
+  const playerUser = async (playerId: string) => (await prisma.user.findFirst({ where: { playerId }, select: { id: true } }))?.id;
+  const teamName = async (id: string) => (await prisma.team.findUnique({ where: { id }, select: { name: true } }))?.name ?? 'A club';
+  const transfersLink = (id: string) => ({ pathname: '/competition/[id]', params: { id, tab: 'transfers' } });
+  /** Under 18 without a guardian's agreement on record: the player can't agree on their own. */
+  const needsGuardian = async (playerId: string) => {
+    const p = await prisma.player.findUnique({ where: { id: playerId }, select: { minor: true, guardianConsent: true } });
+    return !!p?.minor && !p.guardianConsent;
+  };
+  const GUARDIAN = 'They’re under 18, so a guardian has to agree too. Their club records it by ticking Guardian agreed in the squad, then they can agree.';
+
+  // A club asks for a player (the player agrees next), or a player asks to join a club (that club accepts next).
   app.post('/transfers', async (req) => {
     const user = requireUser(req);
-    const b = z.object({ competitionId: z.string(), playerId: z.string(), fromTeamId: z.string(), toTeamId: z.string(), kind: z.enum(['move', 'dual']), note: z.string().optional() }).parse(req.body);
-    if (!isClubAdmin(user, b.toTeamId)) throw forbidden('Only the admin of the club asking for the player can request a transfer');
+    const b = z.object({ competitionId: z.string(), playerId: z.string(), fromTeamId: z.string(), toTeamId: z.string(), kind: z.enum(['move', 'dual']), note: z.string().trim().max(500).optional() }).parse(req.body);
+    const asClub = isClubAdmin(user, b.toTeamId);
+    const asPlayer = !!user.playerId && user.playerId === b.playerId;
+    if (!asClub && !asPlayer) throw forbidden('Only the player, or the admin of the club that wants them, can ask');
     const { c, verdict } = await transferCheck(b);
-    if (!c.teamIds.includes(b.toTeamId)) throw conflict('Your club is not in this league');
+    if (!c.teamIds.includes(b.toTeamId)) throw conflict(asClub ? 'Your club is not in this league' : 'That club is not in this league');
     if (!verdict.ok) throw conflict(verdict.reason);
-    const t = await prisma.transfer.create({ data: { id: newId('tr'), ...b, note: b.note ?? null, status: 'awaitingClub', history: toJson([{ status: 'awaitingClub', at: new Date().toISOString(), by: 'requestingClub' }]) } });
-    await notify(await clubAdminIds(b.fromTeamId), { kind: 'transfer', title: 'A club wants one of your players', body: `${c.name}. Release or turn down.`, link: { pathname: '/competition/[id]', params: { id: c.id, tab: 'transfers' } } });
+    if (asPlayer && (await needsGuardian(b.playerId))) throw conflict(GUARDIAN.replace('They’re', 'You’re').replace('then they can agree', 'then you can ask'));
+    const at = new Date().toISOString();
+    // The player agreeing and the club accepting are the first two steps; someone who is both does both at once.
+    const history: Transfer['history'] = asPlayer
+      ? [{ status: 'awaitingNewClub', at, by: 'player' }, ...(asClub ? [{ status: 'awaitingClub' as const, at, by: 'requestingClub' as const }] : [])]
+      : [{ status: 'awaitingPlayer', at, by: 'requestingClub' }];
+    const status = history.at(-1)!.status;
+    const t = await prisma.transfer.create({ data: { id: newId('tr'), ...b, note: b.note ?? null, status, history: toJson(history) } });
+    const what = b.kind === 'dual' ? 'as a second club' : 'on a move';
+    if (status === 'awaitingPlayer') {
+      const uid = await playerUser(b.playerId);
+      if (uid) await notify([uid], { kind: 'transfer', title: `${await teamName(b.toTeamId)} wants you ${what}`, body: `${c.name}. Agree or decline.`, link: transfersLink(c.id) });
+    } else if (status === 'awaitingNewClub') {
+      await notify(await clubAdminIds(b.toTeamId), { kind: 'transfer', title: `${user.name} wants to join your club ${what}`, body: `${c.name}. Accept or turn down.`, link: transfersLink(c.id) });
+    } else {
+      await notify(await clubAdminIds(b.fromTeamId), { kind: 'transfer', title: 'A club wants one of your players', body: `${c.name}. Release or turn down.`, link: transfersLink(c.id) });
+    }
     return toTransfer(t);
   });
 
   app.post<{ Params: { id: string } }>('/transfers/:id/respond', async (req) => {
     const user = requireUser(req);
-    const { response, note } = z.object({ response: z.enum(['approve', 'reject', 'withdraw', 'dispute']), note: z.string().optional() }).parse(req.body);
+    const { response, note } = z.object({ response: z.enum(['approve', 'reject', 'withdraw', 'dispute']), note: z.string().trim().max(500).optional() }).parse(req.body);
     const row = await prisma.transfer.findUnique({ where: { id: req.params.id } });
     if (!row) throw notFound('Transfer');
     const t = toTransfer(row);
     const c = await comp(t.competitionId);
     const at = new Date().toISOString();
+    const isPlayer = !!user.playerId && user.playerId === t.playerId;
+    const requesting = isClubAdmin(user, t.toTeamId);
     const save = async () => toTransfer(await prisma.transfer.update({ where: { id: t.id }, data: { status: t.status, history: toJson(t.history) } }));
+    const toReleasingClub = async () => {
+      t.status = 'awaitingClub';
+      await notify(await clubAdminIds(t.fromTeamId), { kind: 'transfer', title: 'A club wants one of your players', body: `${c.name}. The player has agreed. Release or turn down.`, link: transfersLink(c.id) });
+    };
 
     if (response === 'withdraw') {
-      if (!isClubAdmin(user, t.toTeamId)) throw forbidden('Only the club that asked can withdraw');
-      if (!['awaitingClub', 'awaitingLeague', 'disputed'].includes(t.status)) throw conflict('This transfer is already decided');
+      // Whoever is on the asking side can call it off while it's open: the player or the club that wants them.
+      if (!requesting && !isPlayer) throw forbidden('Only the player or the club that asked can withdraw');
+      if (!transferOpen(t)) throw conflict('This transfer is already decided');
       t.status = 'withdrawn';
-      t.history.push({ status: 'withdrawn', at, by: 'requestingClub' });
+      t.history.push({ status: 'withdrawn', at, by: isPlayer && !requesting ? 'player' : 'requestingClub', note });
       return save();
     }
     if (response === 'dispute') {
-      if (!isClubAdmin(user, t.toTeamId)) throw forbidden('Only the club that asked can take it to the league');
+      if (!requesting && !(isPlayer && t.startedBy === 'player')) throw forbidden('Only the club that asked, or the player who asked, can take it to the league');
       if (!(t.status === 'rejected' && t.history.at(-1)?.by === 'releasingClub')) throw conflict('Only a transfer the releasing club turned down can go to the league');
       t.status = 'disputed';
-      t.history.push({ status: 'disputed', at, by: 'requestingClub', note });
+      t.history.push({ status: 'disputed', at, by: isPlayer && !requesting ? 'player' : 'requestingClub', note });
+      return save();
+    }
+    if (t.status === 'awaitingPlayer') {
+      if (isPlayer) {
+        if (response === 'approve' && (await needsGuardian(t.playerId))) throw conflict(GUARDIAN.replace('They’re', 'You’re').replace('Their club', 'Your club').replace('then they can agree', 'then you can agree'));
+        t.history.push({ status: response === 'approve' ? 'awaitingClub' : 'rejected', at, by: 'player', note });
+        if (response === 'approve') await toReleasingClub();
+        else t.status = 'rejected';
+        return save();
+      }
+      // A player who isn't on Ovalcast can't agree in the app; a league admin records it (a signed form, say).
+      if (isLeagueAdmin(user, c.orgId)) {
+        if (await playerUser(t.playerId)) throw forbidden('The player is on Ovalcast, so they agree or decline themselves');
+        if (response !== 'approve') throw conflict('Only the player can decline. Ask the club to withdraw instead');
+        if (!note) throw badRequest('Say how the player agreed, for example “signed form, 12 March”');
+        if (await needsGuardian(t.playerId)) throw conflict(GUARDIAN);
+        t.history.push({ status: 'awaitingClub', at, by: 'player', note: `Recorded by the league: ${note}` });
+        await toReleasingClub();
+        return save();
+      }
+      throw forbidden('Only the player can answer this');
+    }
+    if (t.status === 'awaitingNewClub') {
+      if (!requesting) throw forbidden('Only the club the player wants to join can answer this');
+      t.history.push({ status: response === 'approve' ? 'awaitingClub' : 'rejected', at, by: 'requestingClub', note });
+      if (response === 'approve') await toReleasingClub();
+      else t.status = 'rejected';
+      const uid = await playerUser(t.playerId);
+      if (uid) await notify([uid], { kind: 'transfer', title: response === 'approve' ? `${await teamName(t.toTeamId)} accepted you` : `${await teamName(t.toTeamId)} turned down your request`, body: response === 'approve' ? `${c.name}. Your club decides next, then the league.` : c.name, link: transfersLink(c.id) });
       return save();
     }
     if (t.status === 'awaitingClub') {
@@ -422,9 +487,33 @@ export async function competitionRoutes(app: FastifyInstance) {
       }
       t.status = response === 'approve' ? 'approved' : 'rejected';
       t.history.push({ status: t.status, at, by: 'league', note });
+      const uid = await playerUser(t.playerId);
+      if (uid) await notify([uid], { kind: 'transfer', title: response === 'approve' ? (t.kind === 'dual' ? `You can now play for ${await teamName(t.toTeamId)} too` : `You’ve moved to ${await teamName(t.toTeamId)}`) : 'The league turned down your transfer', body: c.name, link: transfersLink(c.id) });
       return save();
     }
     throw conflict('This transfer is already decided');
+  });
+
+  // Ending a second club: the player, either of their clubs, or a league admin. The main club stays;
+  // changing it is a move.
+  app.post<{ Params: { id: string } }>('/registrations/:id/end', async (req) => {
+    const user = requireUser(req);
+    const { note } = z.object({ note: z.string().trim().max(500).optional() }).parse(req.body ?? {});
+    const reg = await prisma.registration.findUnique({ where: { id: req.params.id } });
+    if (!reg || reg.status !== 'active') throw notFound('Squad place');
+    const c = await comp(reg.competitionId);
+    const main = await prisma.registration.findFirst({ where: { competitionId: reg.competitionId, playerId: reg.playerId, status: 'active', primary: true } });
+    if (reg.primary || !main) throw conflict('This is their main club. To change it, ask for a move');
+    const allowed = (!!user.playerId && user.playerId === reg.playerId) || isClubAdmin(user, reg.teamId) || isClubAdmin(user, main.teamId) || isLeagueAdmin(user, c.orgId);
+    if (!allowed) throw forbidden('Only the player, their clubs or the league can end a second club');
+    const ended = await prisma.registration.update({ where: { id: reg.id }, data: { status: 'ended' } });
+    const player = await prisma.player.findUnique({ where: { id: reg.playerId }, select: { name: true } });
+    const told = new Set([...(await clubAdminIds(reg.teamId)), ...(await clubAdminIds(main.teamId))]);
+    const uid = await playerUser(reg.playerId);
+    if (uid) told.add(uid);
+    told.delete(user.id);
+    await notify([...told], { kind: 'transfer', title: `${player?.name ?? 'A player'} no longer plays for ${await teamName(reg.teamId)}`, body: `${c.name}. Their second club ended${note ? `: “${note}”` : '.'}`, link: transfersLink(c.id) });
+    return toRegistration(ended);
   });
 
   // ------------------------------------------------------------- deductions

@@ -28,10 +28,21 @@ export interface RegistrationRef {
   status: 'active' | 'ended';
 }
 
+/**
+ * Where a transfer is. A club that asks waits for the player to agree (`awaitingPlayer`); a player who
+ * asks waits for the club they want to join (`awaitingNewClub`). Then the player's current club
+ * releases them (`awaitingClub`) and the league approves (`awaitingLeague`).
+ */
+export type TransferStatus = 'awaitingPlayer' | 'awaitingNewClub' | 'awaitingClub' | 'awaitingLeague' | 'disputed' | 'approved' | 'rejected' | 'withdrawn';
+
+/** Transfers still being decided: they count towards a player's limit and can be withdrawn. */
+export const OPEN_TRANSFER: readonly TransferStatus[] = ['awaitingPlayer', 'awaitingNewClub', 'awaitingClub', 'awaitingLeague', 'disputed'];
+export const transferOpen = (t: { status: TransferStatus }) => OPEN_TRANSFER.includes(t.status);
+
 export interface TransferRef {
   competitionId: string;
   playerId: string;
-  status: 'awaitingClub' | 'awaitingLeague' | 'disputed' | 'approved' | 'rejected' | 'withdrawn';
+  status: TransferStatus;
 }
 
 export type Verdict = { ok: true } | { ok: false; reason: string };
@@ -66,7 +77,6 @@ export function otherLeagueConflicts(playerId: string, target: LeagueRef, league
   return out;
 }
 
-/** Whether a club may ask for a player now. The league admin's approval re-runs this. */
 /** Whole years old on a date: `dob` and `on` as YYYY-MM-DD (or full ISO dates). */
 export function ageOn(dob: string, on: string): number {
   const [by, bm, bd] = dob.slice(0, 10).split('-').map(Number);
@@ -74,6 +84,7 @@ export function ageOn(dob: string, on: string): number {
   return y - by - (m < bm || (m === bm && d < bd) ? 1 : 0);
 }
 
+/** Whether a club may ask for a player (or a player ask to join a club) now. The league admin's approval re-runs this. */
 export function canTransfer(args: {
   playerId: string;
   fromTeamId: string;
@@ -112,7 +123,7 @@ export function canTransfer(args: {
     }
   }
   const used = args.transfers.filter(
-    (t) => t.playerId === playerId && t.competitionId === league.id && (t.status === 'approved' || (!args.excludePending && (t.status === 'awaitingClub' || t.status === 'awaitingLeague' || t.status === 'disputed'))),
+    (t) => t.playerId === playerId && t.competitionId === league.id && (t.status === 'approved' || (!args.excludePending && transferOpen(t))),
   ).length;
   if (used >= rules.transfers.maxPerPlayer) return { ok: false, reason: `Has used ${used === 1 ? 'their transfer' : `all ${used} transfers`} this season` };
   return { ok: true };
