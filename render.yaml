@@ -7,9 +7,10 @@ services:
     region: frankfurt
     plan: free # starter (or above) for production: free instances sleep when idle
     # --include=dev: NODE_ENV=production would otherwise skip the build tools (esbuild, prisma).
-    buildCommand: npm ci --include=dev && npx prisma generate && npm run build
-    # Migrations, then the reference data (countries and cities), before the new version takes traffic.
-    preDeployCommand: npm run db:deploy && npm run db:reference
+    # Then the migrations and the reference data (countries and cities). Free instances can't run a
+    # pre-deploy command, so they go at the end of the build; on a paid plan, move
+    # "npm run db:deploy && npm run db:reference" to preDeployCommand.
+    buildCommand: npm ci --include=dev && npx prisma generate && npm run build && npm run db:deploy && npm run db:reference
     startCommand: npm start
     healthCheckPath: /health/ready
     envVars:
