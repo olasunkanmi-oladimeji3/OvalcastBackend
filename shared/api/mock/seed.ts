@@ -722,7 +722,9 @@ export function setupFor(
         ? xi.map((pid) => squad.find((p) => p.id === pid)!)
         : squad.slice(0, 11)
     ).map((p) => ({ id: p.id, name: p.name, shortName: p.shortName }));
-    return { id: t.id, name: t.name, shortName: t.shortName, players };
+    // The rest of the squad can come on as substitute fielders: the 12th man (Law 24).
+    const substitutes = squad.filter((p) => !p.guest && !players.some((x) => x.id === p.id)).map((p) => ({ id: p.id, name: p.name, shortName: p.shortName }));
+    return { id: t.id, name: t.name, shortName: t.shortName, players, substitutes };
   };
   return {
     conditions: m.conditions ?? comp?.conditions ?? T20,

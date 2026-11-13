@@ -74,6 +74,12 @@ export interface TeamSetup {
   name: string;
   shortName: string;
   players: PlayerRef[];
+  /**
+   * The 12th man and other substitute fielders (Law 24): squad players outside the XI. They may field,
+   * and keep wicket with the umpires' consent, but not bat, bowl or captain. Scorecards show them as
+   * "sub (Name)".
+   */
+  substitutes?: PlayerRef[];
 }
 
 export interface MatchSetup {

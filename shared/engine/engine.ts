@@ -120,6 +120,8 @@ export function replay(setup: MatchSetup, events: BallEvent[]): MatchState {
   const second = first === t1 ? t2 : t1;
   const nameOf = new Map<string, string>();
   for (const t of setup.teams) for (const p of t.players) nameOf.set(p.id, p.shortName);
+  // Substitute fielders appear on the scorecard as "sub (Name)" (Law 24).
+  for (const t of setup.teams) for (const p of t.substitutes ?? []) if (!nameOf.has(p.id)) nameOf.set(p.id, `sub (${p.shortName})`);
   const squadSize = (teamId: string) => setup.teams.find((t) => t.id === teamId)!.players.length;
 
   // Rain or a late start can cut each side's overs and revise the chase's target.

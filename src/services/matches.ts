@@ -145,7 +145,10 @@ async function buildSetup(m: Match): Promise<MatchSetup> {
     const squad: Player[] = [...playerRows.filter((p) => p.teamId === teamId || (!!t.parentTeamId && p.teamId === t.parentTeamId)).map(toPlayer), ...dualPlayers.filter((p) => dualRegs.some((r) => r.playerId === p.id && r.teamId === teamId))];
     const xi = m.playingXI?.[teamId];
     const chosen = xi ? xi.map((pid) => squad.find((p) => p.id === pid)).filter((p): p is Player => !!p) : squad.filter((p) => !p.guest).slice(0, 11);
-    return { id: t.id, name: t.name, shortName: t.shortName, players: chosen.map((p) => ({ id: p.id, name: p.name, shortName: p.shortName })) };
+    // The rest of the squad can come on as substitute fielders: the 12th man (Law 24).
+    const picked = new Set(chosen.map((p) => p.id));
+    const substitutes = squad.filter((p) => !p.guest && !picked.has(p.id));
+    return { id: t.id, name: t.name, shortName: t.shortName, players: chosen.map((p) => ({ id: p.id, name: p.name, shortName: p.shortName })), substitutes: substitutes.map((p) => ({ id: p.id, name: p.name, shortName: p.shortName })) };
   };
   return {
     conditions: m.conditions ?? (comp ? json<PlayingConditions>(comp.conditions) : T20),
