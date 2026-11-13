@@ -88,6 +88,8 @@ export async function teamRoutes(app: FastifyInstance) {
     if (!isClubAdmin(user, req.params.id)) throw forbidden('Only a club admin can add staff');
     const b = z.object({ name: z.string().trim().min(1, 'Add a name'), role: z.enum(staffRoles), phone: z.string().optional(), playerId: z.string().optional(), userId: z.string().optional() }).parse(req.body);
     const t = await team(req.params.id);
+    // Staff who also play: linked to a player in this club's squad, not any player.
+    if (b.playerId && !(await prisma.player.count({ where: { id: b.playerId, teamId: t.id } }))) throw badRequest('That player isn’t in this club’s squad');
     // A club has one captain and one vice-captain.
     const kept = b.role === 'captain' || b.role === 'viceCaptain' ? staffOf(t).filter((s) => s.role !== b.role) : staffOf(t);
     await prisma.team.update({ where: { id: t.id }, data: { staff: toJson([...kept, { ...b, id: newId('staff') }]) } });
