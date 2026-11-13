@@ -21,6 +21,7 @@ export const toUser = (u: P.User, memberships: P.Membership[], assignedMatchIds:
   memberships: memberships.map((m) => ({ orgId: m.orgId ?? undefined, clubId: m.clubId ?? undefined, role: m.role as User['memberships'][0]['role'] })),
   assignedMatchIds,
   country: u.country ?? undefined,
+  dateOfBirth: u.dateOfBirth ? u.dateOfBirth.toISOString().slice(0, 10) : undefined,
   staff: u.staff || undefined,
   playing: json<User['playing'] | null>(u.playing) ?? undefined,
   follows: { teamIds: [], playerIds: [], competitionIds: [], ...json<Partial<NonNullable<User['follows']>>>(u.follows) },

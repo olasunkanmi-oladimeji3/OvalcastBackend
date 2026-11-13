@@ -52,6 +52,9 @@ export async function registerPlayers(c: Competition, teamId: string, playerIds:
   const players = await db.player.findMany({ where: { id: { in: aliasIds } }, select: { id: true, dateOfBirth: true } });
   const born = new Map<string, string>();
   for (const p of players) if (p.dateOfBirth) born.set(person.get(p.id) ?? p.id, p.dateOfBirth.toISOString().slice(0, 10));
+  // The date of birth given at sign-up, for anyone whose player records don't have one.
+  const accounts = await db.user.findMany({ where: { id: { in: [...new Set(person.values())] }, dateOfBirth: { not: null } }, select: { id: true, dateOfBirth: true } });
+  for (const a of accounts) if (!born.has(a.id)) born.set(a.id, a.dateOfBirth!.toISOString().slice(0, 10));
   const teamIds = [...new Set([teamId, ...regs.map((r) => r.teamId)])];
   const names = new Map((await db.team.findMany({ where: { id: { in: teamIds } }, select: { id: true, name: true } })).map((t) => [t.id, t.name]));
 

@@ -13,6 +13,7 @@ import { registerPlayers } from '~/lib/registration';
 import { applyStoppage, replay, type RainRule } from '@/engine';
 import type { Match } from '@/api/types';
 import { ballEventsFor, forgetSetups, getMatch, refreshFromEvents, saveMatch, setupFor } from '~/services/matches';
+import { checkContact, createInvite } from '~/lib/invites';
 import { comp, enter } from './competitions';
 
 const TEAM_COLOURS = ['#008751', '#7A1F2B', '#1B3A6B', '#B4561B', '#5B2C83', '#0F6E7A', '#8A6D1D', '#22313F', '#C2185B', '#2E5E2A'];
@@ -57,11 +58,18 @@ export async function organiserRoutes(app: FastifyInstance) {
   // Players by name, no accounts needed: the club's admin, or an admin of a league the club plays in.
   app.post<{ Params: { id: string } }>('/teams/:id/players', async (req) => {
     const user = requireUser(req);
-    const b = z.object({ names: names.min(1, 'Type at least one name') }).parse(req.body);
+    // Names alone, or players with an optional email or WhatsApp number: those also get an invitation
+    // that links them to the squad record made here.
+    const b = z.object({ names: names.optional(), players: z.array(z.object({ name: z.string().trim().min(2).max(60), contact: z.string().trim().max(120).optional() })).max(40).optional() }).parse(req.body);
+    const wanted = [...(b.names ?? []).map((name) => ({ name, contact: undefined as string | undefined })), ...(b.players ?? [])];
+    if (!wanted.length) throw badRequest('Type at least one name');
+    for (const w of wanted) if (w.contact) { const ok = checkContact(w.contact.includes('@') ? 'email' : 'whatsapp', w.contact, user.country ?? undefined); if (!ok.ok) throw badRequest(`${w.name}: ${ok.reason}`); }
     const comps = await prisma.competition.findMany({ where: { teamIds: { array_contains: [req.params.id] }, status: { not: 'completed' } }, select: { id: true, orgId: true, playerRules: true } });
     if (!isClubAdmin(user, req.params.id) && !comps.some((c) => isLeagueAdmin(user, c.orgId))) throw forbidden('Only the club’s admin, or an admin of its league, can add players');
     const existing = new Set((await prisma.player.findMany({ where: { teamId: req.params.id, guest: false }, select: { name: true } })).map((p) => p.name.toLowerCase()));
-    const rows = [...new Set(b.names)].filter((n) => !existing.has(n.toLowerCase())).map((n) => playerRow(req.params.id, n));
+    const seen = new Set<string>();
+    const fresh = wanted.filter((w) => !existing.has(w.name.toLowerCase()) && !seen.has(w.name.toLowerCase()) && seen.add(w.name.toLowerCase()));
+    const rows = fresh.map((w) => playerRow(req.params.id, w.name));
     if (!rows.length) throw badRequest('They’re all in the squad already');
     await prisma.player.createMany({ data: rows });
     forgetSetups();
@@ -69,6 +77,8 @@ export async function organiserRoutes(app: FastifyInstance) {
       const c = toCompetition(await prisma.competition.findUniqueOrThrow({ where: { id: row.id } }));
       await registerPlayers(c, req.params.id, rows.map((p) => p.id), { approved: !c.playerRules.squadApproval || isLeagueAdmin(user, c.orgId) });
     }
+    // Invitations for those with a contact: emailed now, or ready to send on WhatsApp from the club page.
+    for (const [i, w] of fresh.entries()) if (w.contact) await createInvite(req.params.id, { name: w.name, channel: w.contact.includes('@') ? 'email' : 'whatsapp', contact: w.contact, playerId: rows[i].id }, user.country ?? undefined);
     return (await prisma.player.findMany({ where: { id: { in: rows.map((r) => r.id) } } })).map(toPlayer);
   });
 

@@ -11,7 +11,7 @@ import { messenger } from '~/lib/messaging';
 import { notify } from '~/lib/repo';
 
 export type InviteChannel = 'whatsapp' | 'email';
-export interface InviteInput { name: string; channel: InviteChannel; contact: string; dateOfBirth?: string }
+export interface InviteInput { name: string; channel: InviteChannel; contact: string; dateOfBirth?: string; playerId?: string }
 
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
@@ -45,7 +45,7 @@ export async function createInvite(teamId: string, input: InviteInput, inviterCo
   const contact = checkContact(input.channel, input.contact, inviterCountry);
   if (!contact.ok) throw badRequest(contact.reason);
   const team = await prisma.team.findUniqueOrThrow({ where: { id: teamId }, select: { name: true } });
-  const inv = await prisma.playerInvite.create({ data: { id: newId('pinv'), teamId, name, channel: input.channel, contact: contact.contact, status: 'pending', dateOfBirth: input.dateOfBirth ? new Date(input.dateOfBirth) : null } });
+  const inv = await prisma.playerInvite.create({ data: { id: newId('pinv'), teamId, name, channel: input.channel, contact: contact.contact, status: 'pending', dateOfBirth: input.dateOfBirth ? new Date(input.dateOfBirth) : null, playerId: input.playerId ?? null } });
   if (input.channel === 'email') {
     await messenger.sendEmail(contact.contact, `${team.name} invited you to join on Ovalcast`, `${inviteMessage(name, team.name, inv.id)}\n\nIf you weren't expecting this, you can ignore this email.`).catch((e) => console.error('[invites] email not sent', e));
   }

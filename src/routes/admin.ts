@@ -21,6 +21,7 @@ import { newApiKey } from '~/routes/partner';
 import { matchesThisMonth, refundMatchPasses } from '~/services/billing';
 import { allows, featureAccess, setFeatureAccess } from '~/services/access';
 import { DECISION_KINDS, decisionEffect, decisionHasWinner, decisionSharesPoints, decisionText, decisionsFor, normaliseIdentifier, ageOn } from '@/engine';
+import { copyBirthDateToPlayers } from '~/routes/auth';
 import { getMatch, saveMatch } from '~/services/matches';
 
 const isOwner = (u: User, orgId: string) => u.memberships.some((m) => m.orgId === orgId && m.role === 'owner');
@@ -325,16 +326,38 @@ export async function adminRoutes(app: FastifyInstance) {
       if ((me.email ?? '').toLowerCase() !== inv.contact.toLowerCase()) throw forbidden(`This invitation was sent to ${maskContact(inv.contact)}. Sign in with that email address to accept it (or add it to your account in Settings).`);
     }
     const current = user.playerId ? await prisma.player.findUnique({ where: { id: user.playerId }, include: { team: { select: { name: true } } } }) : null;
+    const account = await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { dateOfBirth: true } });
+    const born = inv.dateOfBirth ?? account.dateOfBirth;
+    const minor = !!born && (Date.now() - born.getTime()) / (365.25 * 86_400_000) < 18;
+
+    // Added by name with a contact: the invitation is for a squad record that already exists. They're
+    // linked to it (it becomes their profile, or one of their records if they already have one), not
+    // moved and not given a new one.
+    if (inv.playerId) {
+      const record = await prisma.player.findUnique({ where: { id: inv.playerId } });
+      if (record && record.teamId === inv.teamId && (!record.claimedByUserId || record.claimedByUserId === user.id)) {
+        await prisma.$transaction(async (tx) => {
+          if (!current) await tx.user.update({ where: { id: user.id }, data: { playerId: record.id } });
+          else if (current.id !== record.id) await tx.player.update({ where: { id: record.id }, data: { claimedByUserId: user.id } });
+          if (!(await tx.membership.count({ where: { userId: user.id, clubId: inv.teamId, role: 'player' } }))) await tx.membership.create({ data: { id: newId('mem'), userId: user.id, clubId: inv.teamId, role: 'player' } });
+          await tx.playerInvite.update({ where: { id: inv.id }, data: { status: 'joined' } });
+        });
+        await copyBirthDateToPlayers(user.id);
+        const admins = await prisma.membership.findMany({ where: { clubId: inv.teamId, role: 'clubAdmin' }, select: { userId: true } });
+        await notify(admins.map((a) => a.userId), { kind: 'entry', title: `${user.name} linked their account to ${record.name}`, body: 'They accepted your invitation.', link: { pathname: '/team/[id]', params: { id: inv.teamId } } });
+        return { team: toTeam(inv.team), player: toPlayer((await prisma.player.findUniqueOrThrow({ where: { id: current?.id ?? record.id } }))), moved: false };
+      }
+    }
     const elsewhere = current && current.teamId !== inv.teamId && !current.guest;
     if (elsewhere && !move) throw conflict(`You’re in ${current.team.name}’s squad. Accept with “Move to ${inv.team.name}” to switch clubs; your league squad places stay with ${current.team.name} until a league transfer.`);
     const result = await prisma.$transaction(async (tx) => {
       let player = current;
       if (!player) {
         const parts = user.name.split(/\s+/);
-        player = await tx.player.create({ data: { id: newId('player'), teamId: inv.teamId, name: user.name, shortName: parts.length > 1 ? `${parts[0][0]}. ${parts.at(-1)}` : user.name, role: 'allRounder', battingHand: 'R', dateOfBirth: inv.dateOfBirth }, include: { team: { select: { name: true } } } });
+        player = await tx.player.create({ data: { id: newId('player'), teamId: inv.teamId, name: user.name, shortName: parts.length > 1 ? `${parts[0][0]}. ${parts.at(-1)}` : user.name, role: 'allRounder', battingHand: 'R', dateOfBirth: born, minor }, include: { team: { select: { name: true } } } });
         await tx.user.update({ where: { id: user.id }, data: { playerId: player.id } });
       } else {
-        await tx.player.update({ where: { id: player.id }, data: { teamId: inv.teamId, ...(inv.dateOfBirth && !player.dateOfBirth ? { dateOfBirth: inv.dateOfBirth } : {}) } });
+        await tx.player.update({ where: { id: player.id }, data: { teamId: inv.teamId, ...(born && !player.dateOfBirth ? { dateOfBirth: born, ...(minor ? { minor: true } : {}) } : {}) } });
         if (elsewhere) await tx.membership.deleteMany({ where: { userId: user.id, clubId: current!.teamId, role: 'player' } });
       }
       if (!(await tx.membership.count({ where: { userId: user.id, clubId: inv.teamId, role: 'player' } }))) await tx.membership.create({ data: { id: newId('mem'), userId: user.id, clubId: inv.teamId, role: 'player' } });

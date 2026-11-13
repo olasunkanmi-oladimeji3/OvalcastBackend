@@ -53,9 +53,9 @@ export function checkConfig(env = process.env) {
   need('FLUTTERWAVE_SECRET_KEY', 'payments go through Flutterwave');
   need('FLUTTERWAVE_SECRET_HASH', 'Flutterwave’s payment confirmations are checked with it');
 
-  // Without these nobody can verify a phone or email, so nobody can finish signing up.
+  // Codes go by email (no text messages: phone numbers are contacts, not verified), so without an
+  // email provider nobody with an email could finish signing up or reset a password.
   if (env.ALLOW_CONSOLE_MESSAGING !== 'true') {
-    if (smsProvider() === 'console') errors.push('SMS_PROVIDER is not set (termii or twilio): verification codes would only be written to the log');
     if (emailProvider() === 'console') errors.push('EMAIL_PROVIDER is not set (postmark or resend): verification codes would only be written to the log');
   }
   if (smsProvider() === 'termii') need('TERMII_API_KEY', 'SMS goes through Termii');

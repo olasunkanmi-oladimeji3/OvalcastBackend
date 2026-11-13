@@ -22,6 +22,7 @@ import { forgetDevice, getMatch, saveMatch } from '~/services/matches';
 import { emitPartnerEvent } from '~/services/partners';
 import { ballEventsFor } from '~/services/matches';
 import { replayedMatches } from '~/services/stats';
+import { copyBirthDateToPlayers } from '~/routes/auth';
 import { eligibilityFor } from '~/routes/matches';
 
 const HANDOVER_MINUTES = 10;
@@ -167,6 +168,7 @@ export async function featureRoutes(app: FastifyInstance) {
       prisma.playerClaim.update({ where: { id: c.id }, data: { status, respondedAt: new Date() } }),
       ...(status === 'approved' ? [prisma.player.update({ where: { id: c.playerId }, data: { claimedByUserId: c.userId } })] : []),
     ]);
+    if (status === 'approved') await copyBirthDateToPlayers(c.userId);
     await notify(c.userId, { kind: 'entry', title: status === 'approved' ? 'Your claim was approved' : 'Your claim was turned down', body: `${c.playerName}'s matches ${status === 'approved' ? 'now count on your profile' : 'stay as they are'}.` });
     return toClaim(saved as P.PlayerClaim);
   });

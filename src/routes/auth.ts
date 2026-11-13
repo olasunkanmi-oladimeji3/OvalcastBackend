@@ -24,6 +24,23 @@ const returnCodes = process.env.DEV_RETURN_CODES === 'true' && process.env.NODE_
 const phoneRe = /^\+\d{10,15}$/;
 const isEmail = (s: string) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s);
 const normalise = (id: string) => (id.includes('@') ? id.trim().toLowerCase() : id.replace(/\s/g, ''));
+
+/**
+ * A date of birth as YYYY-MM-DD: a real date, in the past, for someone aged 5 to 100. Kept private;
+ * it decides age rules (under-18s, a league's QYP age limit).
+ */
+const dateOfBirth = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Add your date of birth')
+  .refine((v) => {
+    const d = new Date(`${v}T00:00:00Z`);
+    if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== v) return false;
+    const age = (Date.now() - d.getTime()) / (365.25 * 86_400_000);
+    return age >= 5 && age <= 100;
+  }, 'Check your date of birth');
+
+/** No text messages: codes go by email. A phone number is a contact (WhatsApp), not verified. */
+const PHONE_CODES = 'Codes go by email only. Sign in with your email, or add an email to your account in Settings to reset your password.';
 const mask = (id: string) => (id.includes('@') ? `${id[0]}***@${id.split('@')[1]}` : `${id.slice(0, 4)} *** *** ${id.slice(-4)}`);
 
 const findByIdentifier = (identifier: string) => prisma.user.findUnique({ where: identifier.includes('@') ? { email: identifier } : { phone: identifier } });
@@ -80,9 +97,10 @@ async function checkCode(identifier: string, code: string, purpose: 'verify' | '
 }
 
 // Phone-only accounts get SMS alerts by default, since they may not keep data on.
-const defaultSettings = (hasPhone: boolean, hasEmail: boolean, accountType: 'player' | 'organisation', pendingOrganisation?: { name: string; kind: string; city: string; country: string }) => ({
+const defaultSettings = (hasPhone: boolean, _hasEmail: boolean, accountType: 'player' | 'organisation', pendingOrganisation?: { name: string; kind: string; city: string; country: string }) => ({
   dataSaver: false,
-  alerts: { push: true, sms: hasPhone && !hasEmail, whatsapp: hasPhone },
+  // No text messages: alerts go by push and, where there's a number, WhatsApp.
+  alerts: { push: true, sms: false, whatsapp: hasPhone },
   alertTopics: { myMatches: true, myClubs: true, wickets: false, results: true, leagueAdmin: true },
   accountType,
   // A player is taken through setting up their cricket career once they've verified. Someone
@@ -111,11 +129,24 @@ async function createPendingOrganisation(userId: string) {
   await prisma.user.update({ where: { id: userId }, data: { settings: toJson(rest) } });
 }
 
+/**
+ * The account's date of birth onto the person's player records that have none (their own profile and
+ * any they've claimed), marking under-18s, so age rules have it.
+ */
+export async function copyBirthDateToPlayers(userId: string) {
+  const u = await prisma.user.findUnique({ where: { id: userId }, select: { dateOfBirth: true, playerId: true } });
+  if (!u?.dateOfBirth) return;
+  const ids = [...(u.playerId ? [u.playerId] : []), ...(await prisma.player.findMany({ where: { claimedByUserId: userId }, select: { id: true } })).map((p) => p.id)];
+  const minor = (Date.now() - u.dateOfBirth.getTime()) / (365.25 * 86_400_000) < 18;
+  await prisma.player.updateMany({ where: { id: { in: ids }, dateOfBirth: null }, data: { dateOfBirth: u.dateOfBirth, ...(minor ? { minor: true } : {}) } });
+}
+
 export async function authRoutes(app: FastifyInstance) {
   app.post('/auth/sign-up', async (req) => {
     const body = z
       .object({
         name: z.string().trim().min(1, 'Add your name'), email: z.string().optional(), phone: z.string().optional(), password: z.string().min(8, 'Use a password of at least 8 characters'), city: z.string().optional(), country: z.string().trim().max(60).optional(),
+        dateOfBirth,
         // Player: anyone who plays, officiates, coaches, runs a club or follows. Organisation: a body that runs competitions.
         accountType: z.enum(['player', 'organisation']).default('player'),
         organisation: z.object({ name: z.string().trim().min(3, 'Give the organisation its full name').max(80), kind: z.enum(ORG_KINDS), city: z.string().trim().min(1, 'Add the organisation’s city') }).optional(),
@@ -134,10 +165,16 @@ export async function authRoutes(app: FastifyInstance) {
     const id = newId('user');
     const country = body.country || (phone ? countryOfPhone(phone)?.name : undefined) || null;
     const pending = body.accountType === 'organisation' ? { ...body.organisation!, country: country ?? 'Another country' } : undefined;
-    await prisma.user.create({ data: { id, name: body.name, email: email ?? null, phone: phone ?? null, passwordHash: await hashPassword(body.password), city: body.city?.trim() || null, country, settings: toJson(defaultSettings(!!phone, !!email, body.accountType, pending)) } });
+    await prisma.user.create({ data: { id, name: body.name, email: email ?? null, phone: phone ?? null, passwordHash: await hashPassword(body.password), city: body.city?.trim() || null, country, dateOfBirth: new Date(body.dateOfBirth), settings: toJson(defaultSettings(!!phone, !!email, body.accountType, pending)) } });
     await notify(id, body.accountType === 'organisation'
       ? { kind: 'community', title: `Welcome to Ovalcast, ${body.name.split(' ')[0]}`, body: `Once you've verified, ${body.organisation!.name} is ready: create its first competition and invite clubs.` }
       : { kind: 'community', title: `Welcome to Ovalcast, ${body.name.split(' ')[0]}`, body: 'Create your club, join a league, or find a game near you on the Looking for board.', link: { pathname: '/community' } });
+    // A phone number can't be verified without text messages: the account starts straight away.
+    // An email is verified with a code, as before.
+    if (!email) {
+      await createPendingOrganisation(id);
+      return { identifier, session: await startSession(id) };
+    }
     return { identifier, code: await sendCode(identifier, 'verify') };
   });
 
@@ -157,7 +194,8 @@ export async function authRoutes(app: FastifyInstance) {
     // Signing in within 30 days of asking to delete the account cancels the deletion.
     await prisma.user.update({ where: { id: u.id }, data: { failedLogins: 0, lockedUntil: null, deleteOn: null } });
     if (u.deleteOn) await notify(u.id, { kind: 'entry', title: 'Account deletion cancelled', body: 'You signed in, so your account stays. Ask again from Settings any time.' });
-    const verified = identifier.includes('@') ? u.emailVerified : u.phoneVerified;
+    // Phone numbers aren't verified (no text messages); an email must be.
+    const verified = identifier.includes('@') ? u.emailVerified : true;
     // Not verified yet: to the code screen, with the code just sent if there is one.
     if (!verified) return { kind: 'verify', identifier, code: await sendCode(identifier, 'verify', undefined, { reuseRecent: true }) };
     return { kind: 'signedIn', session: await startSession(u.id) };
@@ -166,6 +204,7 @@ export async function authRoutes(app: FastifyInstance) {
   app.post('/auth/code', async (req) => {
     const body = z.object({ identifier: z.string().min(3), purpose: z.enum(['verify', 'reset']) }).parse(req.body);
     const identifier = normalise(body.identifier);
+    if (!identifier.includes('@')) throw badRequest(PHONE_CODES);
     // Resets answer the same way whether or not the account exists, so the form can't be used to find accounts.
     if (body.purpose === 'reset' && !(await findByIdentifier(identifier))) {
       return { channel: identifier.includes('@') ? 'email' : 'phone', destination: mask(identifier), expiresInSeconds: CODE_TTL_MS / 1000, resendInSeconds: RESEND_MS / 1000 } satisfies CodeSent;
@@ -215,13 +254,15 @@ export async function authRoutes(app: FastifyInstance) {
       .object({
         name: z.string().trim().min(1).optional(),
         city: z.string().optional(),
+        dateOfBirth: dateOfBirth.optional(),
         settings: z.object({ dataSaver: z.boolean(), alerts: z.object({ push: z.boolean(), sms: z.boolean(), whatsapp: z.boolean() }), alertTopics: z.record(z.string(), z.boolean()), careerSetupDone: z.boolean().optional() }).optional(),
       })
       .parse(req.body);
     await prisma.user.update({
       where: { id: user.id },
-      data: { ...(body.name ? { name: body.name } : {}), ...(body.city !== undefined ? { city: body.city || null } : {}), ...(body.settings ? { settings: toJson(body.settings) } : {}) },
+      data: { ...(body.name ? { name: body.name } : {}), ...(body.city !== undefined ? { city: body.city || null } : {}), ...(body.dateOfBirth ? { dateOfBirth: new Date(body.dateOfBirth) } : {}), ...(body.settings ? { settings: toJson(body.settings) } : {}) },
     });
+    if (body.dateOfBirth) await copyBirthDateToPlayers(user.id);
     return loadUser(user.id);
   });
 
@@ -231,6 +272,11 @@ export async function authRoutes(app: FastifyInstance) {
     if (!isEmail(value) && !phoneRe.test(value)) throw badRequest('Enter an email, or a phone number with its country code');
     const other = await findByIdentifier(value);
     if (other && other.id !== user.id) throw conflict('Another account already uses that');
+    // A phone number is saved as a contact (WhatsApp), unverified; an email is verified by code.
+    if (!value.includes('@')) {
+      await prisma.user.update({ where: { id: user.id }, data: { phone: value, phoneVerified: false } });
+      return { identifier: value, user: await loadUser(user.id) };
+    }
     return { identifier: value, code: await sendCode(value, 'verify', user.id) };
   });
 }

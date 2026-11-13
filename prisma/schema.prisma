@@ -21,6 +21,8 @@ model User {
   email           String?   @unique
   /// International form, such as +2348025550199.
   phone           String?   @unique
+  /// Given at sign-up; private. Copied to the person's player profile, for age rules (under-18s, QYP).
+  dateOfBirth     DateTime? @map("date_of_birth") @db.Date
   emailVerified   Boolean   @default(false) @map("email_verified")
   phoneVerified   Boolean   @default(false) @map("phone_verified")
   passwordHash    String    @map("password_hash")
@@ -249,6 +251,8 @@ model PlayerInvite {
   status    String
   /// From a spreadsheet upload: copied to the player's profile when they join (for age rules such as QYP).
   dateOfBirth DateTime? @map("date_of_birth") @db.Date
+  /// Set when the player was added by name with a contact: accepting links them to this squad record.
+  playerId  String?  @map("player_id")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
   team      Team     @relation(fields: [teamId], references: [id])
 

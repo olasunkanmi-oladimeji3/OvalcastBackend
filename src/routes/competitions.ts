@@ -356,7 +356,7 @@ export async function competitionRoutes(app: FastifyInstance) {
     const [regs, trs] = await Promise.all([prisma.registration.findMany({ where: { competitionId: c.id } }), prisma.transfer.findMany({ where: { competitionId: c.id } })]);
     const regRefs = regs.map(toRegistration);
     // The date of birth decides an age-limited second club; it's read here and never sent out.
-    const born = (await prisma.player.findUnique({ where: { id: input.playerId }, select: { dateOfBirth: true } }))?.dateOfBirth;
+    const born = (await prisma.player.findUnique({ where: { id: input.playerId }, select: { dateOfBirth: true } }))?.dateOfBirth ?? (await prisma.user.findFirst({ where: { playerId: input.playerId }, select: { dateOfBirth: true } }))?.dateOfBirth;
     return { c, regs: regRefs, verdict: canTransfer({ ...input, league: c, regs: regRefs, transfers: trs.filter((t) => t.id !== excludeId).map(toTransfer), excludePending: !!excludeId, playerBirthDate: born ? born.toISOString().slice(0, 10) : undefined, leagueStartsOn: new Date(c.startsOn).toISOString() }) };
   };
 
@@ -551,7 +551,7 @@ export async function competitionRoutes(app: FastifyInstance) {
     const everywhere = (await prisma.registration.findMany({ where: { playerId: { in: [...mine] } } })).map((r) => ({ ...toRegistration(r), playerId: user.id }));
     const elsewhere = everywhere.filter((r) => r.competitionId !== c.id);
     const comps = (await prisma.competition.findMany({ where: { id: { in: [...new Set([c.id, ...elsewhere.map((r) => r.competitionId)])] } } })).map(toCompetition);
-    const dob = (await prisma.player.findMany({ where: { id: { in: [...mine] }, dateOfBirth: { not: null } }, select: { dateOfBirth: true } }))[0]?.dateOfBirth;
+    const dob = (await prisma.player.findMany({ where: { id: { in: [...mine] }, dateOfBirth: { not: null } }, select: { dateOfBirth: true } }))[0]?.dateOfBirth ?? (await prisma.user.findUnique({ where: { id: user.id }, select: { dateOfBirth: true } }))?.dateOfBirth;
     const names = new Map((await prisma.team.findMany({ where: { id: { in: here.map((r) => r.teamId) } }, select: { id: true, name: true } })).map((t) => [t.id, t.name]));
     const check = (teamId: string, alongside: typeof everywhere) => registrationCheck({ playerId: user.id, teamId, league: c, leagues: comps, regs: [...elsewhere, ...alongside], teamName: (id) => names.get(id) ?? 'another club', playerBirthDate: dob?.toISOString().slice(0, 10), leagueStartsOn: new Date(c.startsOn).toISOString() });
     const mainVerdict = check(mainTeamId, []);

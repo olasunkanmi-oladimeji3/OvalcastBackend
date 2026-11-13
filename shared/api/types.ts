@@ -16,6 +16,8 @@ export interface User {
   memberships: { orgId?: ID; clubId?: ID; role: Role }[];
   /** Fixtures this user is the assigned scorer for. */
   assignedMatchIds: ID[];
+  /** Given at sign-up (YYYY-MM-DD); only the person themselves sees it. Used for age rules. */
+  dateOfBirth?: string;
   /** The user's own player profile, if they play. */
   playerId?: ID;
   phone?: string;
@@ -56,11 +58,13 @@ export type SignInResult = { kind: 'signedIn'; session: AuthSession } | { kind: 
 
 export interface SignUpInput {
   name: string;
-  /** One of email or phone is required; the first one is verified before sign-in. */
+  /** One of email or phone is required. An email is verified with a code; a phone number isn't (no text messages). */
   email?: string;
-  /** International form, for example +2348025550199. */
+  /** International form, for example +2348025550199. A contact (WhatsApp), not verified. */
   phone?: string;
   password: string;
+  /** YYYY-MM-DD. Private; decides age rules (under-18s, a league's QYP age limit). */
+  dateOfBirth: string;
   city?: string;
   /** Sets currency, prices, time zone and payment methods. A country not on Ovalcast's list pays by card in US dollars. */
   country?: string;
@@ -1341,7 +1345,8 @@ export interface OvalcastApi {
   readonly mode: 'mock' | 'http';
 
   // POST /auth/sign-up  (sends a code to the email or phone)
-  signUp(input: SignUpInput): Promise<{ identifier: string; code: CodeSent }>;
+  // An email sign-up returns a code to verify; a phone-only sign-up (not verified) returns a session straight away.
+  signUp(input: SignUpInput): Promise<{ identifier: string; code?: CodeSent; session?: AuthSession }>;
   // POST /auth/sign-in  (identifier is an email or an international phone number)
   signIn(identifier: string, password: string): Promise<SignInResult>;
   // POST /auth/code  (purpose: verify a contact, or reset the password)
@@ -1355,7 +1360,8 @@ export interface OvalcastApi {
   // POST /auth/sign-out
   signOut(token: string): Promise<void>;
   // POST /me/contacts  (add or re-verify an email or phone for the signed-in user; then verifyCode)
-  addContact(value: string): Promise<{ identifier: string; code: CodeSent }>;
+  // An email gets a code to verify; a phone number is saved straight away as a contact (user comes back).
+  addContact(value: string): Promise<{ identifier: string; code?: CodeSent; user?: User }>;
 
   // GET /me
   getMe(): Promise<User>;
@@ -1452,7 +1458,7 @@ export interface OvalcastApi {
   chooseMyClubs(competitionId: ID, choice: { mainTeamId: ID; secondTeamId?: ID }): Promise<Registration[]>;
 
   // PATCH /me
-  updateMe(patch: Partial<Pick<User, 'name' | 'phone' | 'city' | 'settings'>>): Promise<User>;
+  updateMe(patch: Partial<Pick<User, 'name' | 'phone' | 'city' | 'settings' | 'dateOfBirth'>>): Promise<User>;
   // GET /notifications , POST /notifications/read
   listNotifications(): Promise<AppNotification[]>;
   markNotificationsRead(): Promise<void>;
@@ -1473,7 +1479,8 @@ export interface OvalcastApi {
   // POST /matches/:id/guests  (a guest player for one match, within the league's limit)
   addGuestPlayer(matchId: ID, teamId: ID, name: string): Promise<Player>;
   // POST /teams/:id/players  (club admin, or an admin of a league the team plays in: players by name, no accounts needed)
-  addPlayersToSquad(teamId: ID, names: string[]): Promise<Player[]>;
+  // Names, or players with an optional email or WhatsApp number (those also get an invitation linked to their record).
+  addPlayersToSquad(teamId: ID, names: string[] | { name: string; contact?: string }[]): Promise<Player[]>;
   // POST /competitions/:id/teams  (league admin: a team typed in by name, with any players, entered straight away; the admin runs it until they hand it on)
   addTeamByName(competitionId: ID, input: { name: string; players?: string[] }): Promise<Team>;
   // POST /competitions/:id/knockouts  (league admin; seeds the bracket from the table, or draws a straight knockout)
