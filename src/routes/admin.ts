@@ -14,6 +14,8 @@ import { newId } from '~/lib/ids';
 import { logStaff } from '~/lib/staffLog';
 import { embedSettingsOf } from './embeds';
 import { isClubAdmin, isLeagueAdmin, loadUser, notify, toCompetition, toOrg, toPlayer, toRegistration, toTeam } from '~/lib/repo';
+import { registerPlayers, tellAboutHolds } from '~/lib/registration';
+import { maskContact, toInvite as toInviteView } from '~/lib/invites';
 import { storage } from '~/lib/storage';
 import { newApiKey } from '~/routes/partner';
 import { matchesThisMonth, refundMatchPasses } from '~/services/billing';
@@ -301,30 +303,54 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ----------------------------------------------------------- invite links
+  // What the invited person sees. The contact is masked: the link may be forwarded.
   app.get<{ Params: { id: string } }>('/invites/:id', async (req) => {
     const inv = await prisma.playerInvite.findUnique({ where: { id: req.params.id }, include: { team: true } });
     if (!inv) throw notFound('Invitation');
-    return { invite: { id: inv.id, teamId: inv.teamId, name: inv.name, channel: inv.channel, contact: inv.contact, status: inv.status, createdAt: inv.createdAt.toISOString() }, team: toTeam(inv.team) };
+    return { invite: { ...toInviteView(inv), contact: maskContact(inv.contact) }, team: toTeam(inv.team), emailOnly: inv.channel === 'email' };
   });
+
+  // Accepting: with no player profile yet, they get one in this club. With a profile at another club,
+  // they're asked first (move: true moves their profile here; their league squad places stay until the
+  // leagues' own transfers). Either way they're registered into the club's current leagues, with each
+  // league's player rules checked (a hold, not a refusal, when something clashes).
   app.post<{ Params: { id: string } }>('/invites/:id/accept', async (req) => {
     const user = requireUser(req);
+    const { move } = z.object({ move: z.boolean().optional() }).parse(req.body ?? {});
     const inv = await prisma.playerInvite.findUnique({ where: { id: req.params.id }, include: { team: true } });
     if (!inv) throw notFound('Invitation');
     if (inv.status !== 'pending') throw conflict(inv.status === 'joined' ? 'This invitation has already been used' : 'This invitation was cancelled');
+    if (inv.channel === 'email') {
+      const me = await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { email: true } });
+      if ((me.email ?? '').toLowerCase() !== inv.contact.toLowerCase()) throw forbidden(`This invitation was sent to ${maskContact(inv.contact)}. Sign in with that email address to accept it (or add it to your account in Settings).`);
+    }
+    const current = user.playerId ? await prisma.player.findUnique({ where: { id: user.playerId }, include: { team: { select: { name: true } } } }) : null;
+    const elsewhere = current && current.teamId !== inv.teamId && !current.guest;
+    if (elsewhere && !move) throw conflict(`You’re in ${current.team.name}’s squad. Accept with “Move to ${inv.team.name}” to switch clubs; your league squad places stay with ${current.team.name} until a league transfer.`);
     const result = await prisma.$transaction(async (tx) => {
-      let player = user.playerId ? await tx.player.findUnique({ where: { id: user.playerId } }) : null;
+      let player = current;
       if (!player) {
         const parts = user.name.split(/\s+/);
-        player = await tx.player.create({ data: { id: newId('player'), teamId: inv.teamId, name: user.name, shortName: parts.length > 1 ? `${parts[0][0]}. ${parts.at(-1)}` : user.name, role: 'allRounder', battingHand: 'R' } });
+        player = await tx.player.create({ data: { id: newId('player'), teamId: inv.teamId, name: user.name, shortName: parts.length > 1 ? `${parts[0][0]}. ${parts.at(-1)}` : user.name, role: 'allRounder', battingHand: 'R', dateOfBirth: inv.dateOfBirth }, include: { team: { select: { name: true } } } });
         await tx.user.update({ where: { id: user.id }, data: { playerId: player.id } });
+      } else {
+        await tx.player.update({ where: { id: player.id }, data: { teamId: inv.teamId, ...(inv.dateOfBirth && !player.dateOfBirth ? { dateOfBirth: inv.dateOfBirth } : {}) } });
+        if (elsewhere) await tx.membership.deleteMany({ where: { userId: user.id, clubId: current!.teamId, role: 'player' } });
       }
       if (!(await tx.membership.count({ where: { userId: user.id, clubId: inv.teamId, role: 'player' } }))) await tx.membership.create({ data: { id: newId('mem'), userId: user.id, clubId: inv.teamId, role: 'player' } });
       await tx.playerInvite.update({ where: { id: inv.id }, data: { status: 'joined' } });
-      return player;
+      return tx.player.findUniqueOrThrow({ where: { id: player.id } });
     });
+    // The club's current leagues, with each league's rules checked.
+    const leagues = await prisma.competition.findMany({ where: { teamIds: { array_contains: [inv.teamId] }, status: { not: 'completed' } } });
+    for (const row of leagues) {
+      const c = toCompetition(row);
+      await tellAboutHolds(c, inv.teamId, await registerPlayers(c, inv.teamId, [result.id]));
+    }
     const admins = await prisma.membership.findMany({ where: { clubId: inv.teamId, role: 'clubAdmin' }, select: { userId: true } });
-    await notify(admins.map((a) => a.userId), { kind: 'entry', title: `${user.name} joined ${inv.team.name}`, body: 'They accepted your invitation.', link: { pathname: '/team/[id]', params: { id: inv.teamId } } });
-    return { team: toTeam(inv.team), player: toPlayer(result) };
+    await notify(admins.map((a) => a.userId), { kind: 'entry', title: `${user.name} joined ${inv.team.name}`, body: elsewhere ? `They moved from ${current!.team.name}.` : 'They accepted your invitation.', link: { pathname: '/team/[id]', params: { id: inv.teamId } } });
+    if (elsewhere) await notify((await prisma.membership.findMany({ where: { clubId: current!.teamId, role: 'clubAdmin' }, select: { userId: true } })).map((a) => a.userId), { kind: 'entry', title: `${user.name} moved to ${inv.team.name}`, body: 'They accepted an invitation from another club. Their league squad places with you stay until a league transfer.', link: { pathname: '/team/[id]', params: { id: current!.teamId } } });
+    return { team: toTeam(inv.team), player: toPlayer(result), moved: !!elsewhere };
   });
 
   // ------------------------------------------------------------ following
@@ -400,7 +426,8 @@ export async function adminRoutes(app: FastifyInstance) {
       for (const teamId of d.teamIds) {
         await prisma.entry.create({ data: { id: newId('entry'), competitionId: id, teamId, kind: 'invite', status: 'accepted', respondedAt: new Date() } });
         const squad = await prisma.player.findMany({ where: { teamId, guest: false }, select: { id: true } });
-        if (squad.length) await prisma.registration.createMany({ data: squad.map((p) => ({ id: newId('reg'), competitionId: id, playerId: p.id, teamId, primary: true, since: new Date(), status: 'active', approved: !old.playerRules.squadApproval })) });
+        const edition = toCompetition(row);
+        await tellAboutHolds(edition, teamId, await registerPlayers(edition, teamId, squad.map((p) => p.id)));
       }
       created.push(toCompetition(row));
     }

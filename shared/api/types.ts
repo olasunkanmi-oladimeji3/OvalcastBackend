@@ -265,6 +265,15 @@ export interface Registration {
   status: 'active' | 'ended';
   /** Leagues that approve squads: false until a league admin approves the player. */
   approved?: boolean;
+  /**
+   * Set when the league's player rules held this player back (another club here, the QYP age,
+   * another league's rules). They can't be picked until they choose their clubs or a league admin
+   * releases them.
+   */
+  heldReason?: string;
+  /** A league admin's reason for releasing a held player, and who did it. */
+  overrideNote?: string;
+  overrideBy?: string;
 }
 
 /**
@@ -812,10 +821,25 @@ export interface PlayerInvite {
   id: ID;
   teamId: ID;
   name: string;
-  channel: 'whatsapp' | 'sms' | 'email';
+  /** WhatsApp (the club's phone sends the link) or email (sent by Ovalcast). Older invites may say sms. */
+  channel: 'whatsapp' | 'email' | 'sms';
   contact: string;
   status: 'pending' | 'joined' | 'cancelled';
   createdAt: ISODate;
+  /** The personal link that joins the club. */
+  link?: string;
+  /** From a spreadsheet upload; copied to the player's profile when they join. */
+  dateOfBirth?: string;
+}
+
+/** One row of an uploaded player spreadsheet, checked; `problem` says why it can't be invited. */
+export interface RosterRow {
+  row: number;
+  name: string;
+  contact: string;
+  channel?: 'whatsapp' | 'email';
+  dateOfBirth?: string;
+  problem?: string;
 }
 
 export interface CreateTeamInput {
@@ -1239,6 +1263,8 @@ export interface IssuedApiKey {
 export interface InviteView {
   invite: PlayerInvite;
   team: Team;
+  /** Sent by email: only an account with that email address can accept it. */
+  emailOnly?: boolean;
 }
 
 export interface Clip {
@@ -1384,7 +1410,11 @@ export interface OvalcastApi {
   createTeam(input: CreateTeamInput): Promise<Team>;
   // GET /teams/:id/invites , POST /teams/:id/invites , POST /invites/:id/cancel
   listPlayerInvites(teamId: ID): Promise<PlayerInvite[]>;
-  invitePlayer(teamId: ID, input: Pick<PlayerInvite, 'name' | 'channel' | 'contact'>): Promise<PlayerInvite>;
+  invitePlayer(teamId: ID, input: { name: string; channel: 'whatsapp' | 'email'; contact: string }): Promise<PlayerInvite>;
+  // POST /teams/:id/invites/read (a .csv or .xlsx file): checked rows, nothing created yet
+  readRoster(teamId: ID, file: { fileUri: string; name: string }): Promise<{ rows: RosterRow[] }>;
+  // POST /teams/:id/invites/bulk: one invitation per row (emails are sent; WhatsApp ones come back with links)
+  bulkInvite(teamId: ID, rows: { name: string; channel: 'whatsapp' | 'email'; contact: string; dateOfBirth?: string }[]): Promise<PlayerInvite[]>;
   cancelPlayerInvite(inviteId: ID): Promise<PlayerInvite>;
 
   // POST /competitions  (league admin of input.orgId)
@@ -1416,6 +1446,10 @@ export interface OvalcastApi {
   respondToTransfer(transferId: ID, response: 'approve' | 'reject' | 'withdraw' | 'dispute', note?: string): Promise<Transfer>;
   // POST /registrations/:id/end  (ends a second club: the player, either club, or a league admin)
   endRegistration(registrationId: ID, note?: string): Promise<Registration>;
+  // POST /registrations/:id/release  (a league admin releases a held player, with a reason)
+  releaseRegistration(registrationId: ID, note: string): Promise<Registration>;
+  // POST /competitions/:id/my-clubs  (the player chooses their main club, and a second club where allowed)
+  chooseMyClubs(competitionId: ID, choice: { mainTeamId: ID; secondTeamId?: ID }): Promise<Registration[]>;
 
   // PATCH /me
   updateMe(patch: Partial<Pick<User, 'name' | 'phone' | 'city' | 'settings'>>): Promise<User>;
@@ -1596,7 +1630,8 @@ export interface OvalcastApi {
 
   // Joining a club from an invite link. GET /invites/:id , POST /invites/:id/accept
   getInvite(inviteId: ID): Promise<InviteView>;
-  acceptInvite(inviteId: ID): Promise<{ team: Team; player: Player }>;
+  // move: true when the player is in another club's squad and chooses to switch
+  acceptInvite(inviteId: ID, opts?: { move?: boolean }): Promise<{ team: Team; player: Player; moved?: boolean }>;
 
   // Following. POST /me/follows , DELETE /me/follows
   follow(kind: 'team' | 'player' | 'competition', id: ID): Promise<User>;

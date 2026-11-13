@@ -10,6 +10,7 @@ import { newId } from '~/lib/ids';
 import { isClubAdmin, toPlayer, toTeam } from '~/lib/repo';
 import { storage } from '~/lib/storage';
 import { playerAliases } from '~/routes/features';
+import { createInvite, readRoster, toInvite as toInviteView } from '~/lib/invites';
 import { aggregate, mergeFigures, replayedMatches, type Figures } from '~/services/stats';
 
 async function team(id: string) {
@@ -106,14 +107,36 @@ export async function teamRoutes(app: FastifyInstance) {
   app.get<{ Params: { id: string } }>('/teams/:id/invites', async (req) => {
     const user = requireUser(req);
     if (!isClubAdmin(user, req.params.id)) throw forbidden('Only a club admin can see who has been invited');
-    return (await prisma.playerInvite.findMany({ where: { teamId: req.params.id, status: 'pending' } })).map(toInvite);
+    return (await prisma.playerInvite.findMany({ where: { teamId: req.params.id, status: 'pending' }, orderBy: { createdAt: 'desc' } })).map(toInviteView);
   });
+  // By WhatsApp (the admin's phone sends the link) or email (sent from here). No SMS.
   app.post<{ Params: { id: string } }>('/teams/:id/invites', async (req) => {
     const user = requireUser(req);
     if (!isClubAdmin(user, req.params.id)) throw forbidden('Only a club admin can invite players');
-    const b = z.object({ name: z.string().trim().min(1), channel: z.enum(['whatsapp', 'sms', 'email']), contact: z.string().trim().min(3) }).parse(req.body);
-    // Production: send the personal link through the chosen channel.
-    return toInvite(await prisma.playerInvite.create({ data: { id: newId('pinv'), teamId: req.params.id, ...b, status: 'pending' } }));
+    const b = z.object({ name: z.string().trim().min(1, 'Give the player’s name').max(80), channel: z.enum(['whatsapp', 'email']), contact: z.string().trim().min(3).max(120) }).parse(req.body);
+    return createInvite(req.params.id, b, user.country ?? undefined);
+  });
+  // A spreadsheet of players (.csv or .xlsx): read and checked, nothing created yet.
+  app.post<{ Params: { id: string } }>('/teams/:id/invites/read', async (req) => {
+    const user = requireUser(req);
+    if (!isClubAdmin(user, req.params.id)) throw forbidden('Only a club admin can invite players');
+    const file = await req.file();
+    if (!file) throw badRequest('Attach a .csv or .xlsx file');
+    if (!/\.(csv|xlsx)$/i.test(file.filename)) throw badRequest('Use a .csv or .xlsx file');
+    const [squad, pending] = await Promise.all([
+      prisma.player.findMany({ where: { teamId: req.params.id, guest: false }, select: { name: true } }),
+      prisma.playerInvite.findMany({ where: { teamId: req.params.id, status: 'pending' }, select: { contact: true } }),
+    ]);
+    return { rows: await readRoster(await file.toBuffer(), file.filename, user.country ?? undefined, { names: squad.map((p) => p.name), contacts: pending.map((i) => i.contact) }) };
+  });
+  // The checked rows the admin confirmed: one invitation each (emails go now; WhatsApp ones come back with their links).
+  app.post<{ Params: { id: string } }>('/teams/:id/invites/bulk', async (req) => {
+    const user = requireUser(req);
+    if (!isClubAdmin(user, req.params.id)) throw forbidden('Only a club admin can invite players');
+    const { rows } = z.object({ rows: z.array(z.object({ name: z.string().trim().min(1).max(80), channel: z.enum(['whatsapp', 'email']), contact: z.string().trim().min(3).max(120), dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() })).min(1).max(300) }).parse(req.body);
+    const out = [];
+    for (const r of rows) out.push(await createInvite(req.params.id, r, user.country ?? undefined));
+    return out;
   });
   app.post<{ Params: { id: string } }>('/invites/:id/cancel', async (req) => {
     const user = requireUser(req);

@@ -207,7 +207,7 @@ export const toTransfer = (t: P.Transfer): Transfer => ({
 });
 
 export const toDeduction = (d: P.Deduction) => ({ ...d, matchId: d.matchId ?? undefined, at: d.at.toISOString(), revokedAt: iso(d.revokedAt) });
-export const toRegistration = (r: P.Registration) => ({ ...r, since: r.since.toISOString(), status: r.status as 'active' | 'ended' });
+export const toRegistration = (r: P.Registration) => ({ ...r, since: r.since.toISOString(), status: r.status as 'active' | 'ended', heldReason: r.heldReason ?? undefined, overrideNote: r.overrideNote ?? undefined, overrideBy: r.overrideBy ?? undefined });
 
 // ------------------------------------------------------------ permissions
 

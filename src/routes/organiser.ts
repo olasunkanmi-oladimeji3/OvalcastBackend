@@ -8,7 +8,8 @@ import { oneAtATime } from '~/lib/lock';
 import { requireUser } from '~/lib/auth';
 import { badRequest, conflict, forbidden } from '~/lib/errors';
 import { newId } from '~/lib/ids';
-import { isClubAdmin, isLeagueAdmin, toPlayer, toTeam } from '~/lib/repo';
+import { isClubAdmin, isLeagueAdmin, toCompetition, toPlayer, toTeam } from '~/lib/repo';
+import { registerPlayers } from '~/lib/registration';
 import { applyStoppage, replay, type RainRule } from '@/engine';
 import type { Match } from '@/api/types';
 import { ballEventsFor, forgetSetups, getMatch, refreshFromEvents, saveMatch, setupFor } from '~/services/matches';
@@ -64,9 +65,9 @@ export async function organiserRoutes(app: FastifyInstance) {
     if (!rows.length) throw badRequest('They’re all in the squad already');
     await prisma.player.createMany({ data: rows });
     forgetSetups();
-    for (const c of comps) {
-      const approval = !!(c.playerRules as { squadApproval?: boolean } | null)?.squadApproval;
-      await prisma.registration.createMany({ data: rows.map((p) => ({ id: newId('reg'), competitionId: c.id, playerId: p.id, teamId: req.params.id, primary: true, since: new Date(), status: 'active', approved: !approval || isLeagueAdmin(user, c.orgId) })) });
+    for (const row of comps) {
+      const c = toCompetition(await prisma.competition.findUniqueOrThrow({ where: { id: row.id } }));
+      await registerPlayers(c, req.params.id, rows.map((p) => p.id), { approved: !c.playerRules.squadApproval || isLeagueAdmin(user, c.orgId) });
     }
     return (await prisma.player.findMany({ where: { id: { in: rows.map((r) => r.id) } } })).map(toPlayer);
   });

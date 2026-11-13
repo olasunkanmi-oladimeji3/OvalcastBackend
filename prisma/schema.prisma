@@ -242,11 +242,13 @@ model PlayerInvite {
   id        String   @id
   teamId    String   @map("team_id")
   name      String
-  /// whatsapp | sms | email
+  /// whatsapp | email (older invites may say sms)
   channel   String
   contact   String
   /// pending | joined | cancelled
   status    String
+  /// From a spreadsheet upload: copied to the player's profile when they join (for age rules such as QYP).
+  dateOfBirth DateTime? @map("date_of_birth") @db.Date
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
   team      Team     @relation(fields: [teamId], references: [id])
 
@@ -339,6 +341,13 @@ model Registration {
   status        String
   /// Leagues that approve squads: false until a league admin approves the player.
   approved      Boolean     @default(true)
+  /// Why the league's rules held this player back (already in another club here, over the QYP age,
+  /// another league's rules). Held players can't be picked until the player chooses their clubs or a
+  /// league admin releases them.
+  heldReason    String?     @map("held_reason")
+  /// A league admin's reason for releasing a held player, and who did it.
+  overrideNote  String?     @map("override_note")
+  overrideBy    String?     @map("override_by")
   competition   Competition @relation(fields: [competitionId], references: [id])
   player        Player      @relation(fields: [playerId], references: [id])
   team          Team        @relation(fields: [teamId], references: [id])

@@ -151,6 +151,8 @@ export async function eligibilityFor(matchId: string): Promise<MatchEligibility>
         if (plays && plays !== teamId) return { playerId, ok: false, reason: 'Plays for their first club when these clubs meet', appearances: apps };
         const clash = otherLeagueConflicts(playerId, c, comps.map(toCompetition), regs)[0];
         if (clash) return { playerId, ok: false, reason: clash.reason, appearances: apps };
+        const hold = regs.find((r) => r.competitionId === c.id && r.playerId === playerId && r.teamId === teamId && r.status === 'active' && r.heldReason);
+        if (hold) return { playerId, ok: false, reason: `Held by the league's player rules: ${hold.heldReason}`, appearances: apps };
         if (c.playerRules.squadApproval && regs.some((r) => r.competitionId === c.id && r.playerId === playerId && r.teamId === teamId && r.status === 'active' && r.approved === false)) return { playerId, ok: false, reason: 'Waiting for the league to approve the squad', appearances: apps };
         if (knockout && apps < c.playerRules.minMatchesForKnockouts) return { playerId, ok: false, reason: `Played ${apps} of the ${c.playerRules.minMatchesForKnockouts} group matches needed`, appearances: apps };
       }

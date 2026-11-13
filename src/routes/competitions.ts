@@ -4,13 +4,14 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { Competition, Leaderboards, Match, Payment, SeriesSummary, Standings, Transfer } from '@/api/types';
-import { buildBracket, canTransfer, fitGroups, roundRobin, standings, tableResult, transferOpen } from '@/engine';
+import { buildBracket, canTransfer, fitGroups, registrationCheck, roundRobin, standings, tableResult, transferOpen } from '@/engine';
 import { entryShareFor } from '~/lib/shares';
 import { prisma, toJson } from '~/db/client';
 import { requireUser } from '~/lib/auth';
 import { ApiError, badRequest, conflict, forbidden, notFound } from '~/lib/errors';
 import { newId } from '~/lib/ids';
 import { oneAtATime } from '~/lib/lock';
+import { registerPlayers, tellAboutHolds } from '~/lib/registration';
 import { clubAdminIds, isClubAdmin, isLeagueAdmin, matchData, notify, toCompetition, toDeduction, toEntry, toMatch, toRegistration, toTransfer } from '~/lib/repo';
 import { T20 } from '~/services/matches';
 import { checkNewLeague, startCheckout } from '~/services/billing';
@@ -45,16 +46,15 @@ async function championOf(c: Competition, played: Match[]): Promise<string | und
   return (await groupTable(c, g.id, g.teamIds))[0]?.teamId;
 }
 
-/** Accepting a club: put it in the smallest group of the first stage and register its squad. */
+/** Accepting a club: put it in the smallest group of the first stage and register its squad, with the league's player rules checked for each player. */
 export async function enter(c: Competition, teamId: string) {
   if (c.teamIds.includes(teamId)) return;
   c.teamIds.push(teamId);
   const groups = c.stages[0].groups;
   groups.reduce((a, b) => (b.teamIds.length < a.teamIds.length ? b : a)).teamIds.push(teamId);
   await saveComp(c);
-  const squad = await prisma.player.findMany({ where: { teamId, guest: false } });
-  const already = new Set((await prisma.registration.findMany({ where: { competitionId: c.id, status: 'active' }, select: { playerId: true } })).map((r) => r.playerId));
-  if (squad.length) await prisma.registration.createMany({ data: squad.map((p) => ({ id: newId('reg'), competitionId: c.id, playerId: p.id, teamId, primary: !already.has(p.id), since: new Date(), status: 'active', approved: !c.playerRules.squadApproval })) });
+  const squad = await prisma.player.findMany({ where: { teamId, guest: false }, select: { id: true } });
+  await tellAboutHolds(c, teamId, await registerPlayers(c, teamId, squad.map((p) => p.id)));
 }
 
 async function insertBracket(c: Competition, seeds: string[], stageId: string, groupId: string, start: Date) {
@@ -514,6 +514,60 @@ export async function competitionRoutes(app: FastifyInstance) {
     told.delete(user.id);
     await notify([...told], { kind: 'transfer', title: `${player?.name ?? 'A player'} no longer plays for ${await teamName(reg.teamId)}`, body: `${c.name}. Their second club ended${note ? `: “${note}”` : '.'}`, link: transfersLink(c.id) });
     return toRegistration(ended);
+  });
+
+  // A held player (see lib/registration.ts): a league admin releases them, with a reason the clubs see.
+  app.post<{ Params: { id: string } }>('/registrations/:id/release', async (req) => {
+    const user = requireUser(req);
+    const { note } = z.object({ note: z.string().trim().min(3, 'Say why, for example “approved by the league committee, 4 April”').max(500) }).parse(req.body);
+    const reg = await prisma.registration.findUnique({ where: { id: req.params.id } });
+    if (!reg || reg.status !== 'active') throw notFound('Squad place');
+    const c = await comp(reg.competitionId);
+    if (!isLeagueAdmin(user, c.orgId)) throw forbidden('Only a league admin can release a held player');
+    if (!reg.heldReason) throw conflict('This player isn’t held');
+    const saved = await prisma.registration.update({ where: { id: reg.id }, data: { heldReason: null, overrideNote: note, overrideBy: user.name } });
+    const player = await prisma.player.findUnique({ where: { id: reg.playerId }, select: { name: true } });
+    const uid = (await prisma.user.findFirst({ where: { playerId: reg.playerId }, select: { id: true } }))?.id;
+    await notify([...new Set([...(await clubAdminIds(reg.teamId)), ...(uid ? [uid] : [])])], { kind: 'entry', title: `${player?.name ?? 'A player'} released by the league`, body: `${c.name}: “${note}”`, link: transfersLink(c.id) });
+    return toRegistration(saved);
+  });
+
+  // The player settles having more than one club in a league: which is their main club (they play for
+  // it when the clubs meet) and, where the league allows a second club (QYP), which is the second.
+  // Any other squad places they have in this league end.
+  app.post<{ Params: { id: string } }>('/competitions/:id/my-clubs', async (req) => {
+    const user = requireUser(req);
+    const { mainTeamId, secondTeamId } = z.object({ mainTeamId: z.string(), secondTeamId: z.string().optional() }).parse(req.body);
+    if (!user.playerId) throw forbidden('Only the player can choose their clubs');
+    if (secondTeamId === mainTeamId) throw badRequest('Choose a different second club');
+    const c = await comp(req.params.id);
+    const mine = new Set([user.playerId, ...(await prisma.player.findMany({ where: { claimedByUserId: user.id }, select: { id: true } })).map((p) => p.id)]);
+    const here = await prisma.registration.findMany({ where: { competitionId: c.id, playerId: { in: [...mine] }, status: 'active' } });
+    const main = here.find((r) => r.teamId === mainTeamId);
+    const second = secondTeamId ? here.find((r) => r.teamId === secondTeamId) : undefined;
+    if (!main) throw badRequest('You’re not in that club’s squad for this league');
+    if (secondTeamId && !second) throw badRequest('You’re not in that club’s squad for this league');
+    // The same rules a new registration meets: main first, then the second beside it.
+    const everywhere = (await prisma.registration.findMany({ where: { playerId: { in: [...mine] } } })).map((r) => ({ ...toRegistration(r), playerId: user.id }));
+    const elsewhere = everywhere.filter((r) => r.competitionId !== c.id);
+    const comps = (await prisma.competition.findMany({ where: { id: { in: [...new Set([c.id, ...elsewhere.map((r) => r.competitionId)])] } } })).map(toCompetition);
+    const dob = (await prisma.player.findMany({ where: { id: { in: [...mine] }, dateOfBirth: { not: null } }, select: { dateOfBirth: true } }))[0]?.dateOfBirth;
+    const names = new Map((await prisma.team.findMany({ where: { id: { in: here.map((r) => r.teamId) } }, select: { id: true, name: true } })).map((t) => [t.id, t.name]));
+    const check = (teamId: string, alongside: typeof everywhere) => registrationCheck({ playerId: user.id, teamId, league: c, leagues: comps, regs: [...elsewhere, ...alongside], teamName: (id) => names.get(id) ?? 'another club', playerBirthDate: dob?.toISOString().slice(0, 10), leagueStartsOn: new Date(c.startsOn).toISOString() });
+    const mainVerdict = check(mainTeamId, []);
+    const mainRef = { ...toRegistration(main), playerId: user.id, status: 'active' as const };
+    const secondVerdict = secondTeamId ? check(secondTeamId, [mainRef]) : undefined;
+    if (secondVerdict && !secondVerdict.ok && secondVerdict.canChoose) throw conflict(`${names.get(secondTeamId!) ?? 'That club'} can’t be your second club: ${secondVerdict.reason.replace(/^Already plays for [^.;]+[.;] ?/, '')}`);
+    await prisma.$transaction(async (tx) => {
+      await tx.registration.update({ where: { id: main.id }, data: { primary: true, heldReason: mainVerdict.ok ? null : mainVerdict.reason } });
+      if (second && secondVerdict) await tx.registration.update({ where: { id: second.id }, data: { primary: false, heldReason: secondVerdict.ok ? null : secondVerdict.reason } });
+      const others = here.filter((r) => r.id !== main.id && r.id !== second?.id).map((r) => r.id);
+      if (others.length) await tx.registration.updateMany({ where: { id: { in: others } }, data: { status: 'ended' } });
+    });
+    const told = new Set<string>();
+    for (const r of here) for (const id of await clubAdminIds(r.teamId)) told.add(id);
+    await notify([...told], { kind: 'entry', title: `${user.name} chose their clubs in ${c.name}`, body: `Main club: ${names.get(mainTeamId)}${secondTeamId ? `. Second club: ${names.get(secondTeamId)}` : ''}.`, link: transfersLink(c.id) });
+    return (await prisma.registration.findMany({ where: { competitionId: c.id, playerId: { in: [...mine] } } })).map(toRegistration);
   });
 
   // ------------------------------------------------------------- deductions

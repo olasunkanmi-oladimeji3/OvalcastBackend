@@ -135,3 +135,45 @@ export function clubWhenClubsMeet(playerId: string, competitionId: string, teamI
   if (mine.length < 2) return mine[0]?.teamId;
   return (mine.find((r) => r.primary) ?? mine[0]).teamId;
 }
+
+/**
+ * Whether a person may be registered for a club in a league, checked whenever a squad is
+ * registered (a club joining a league, the next season's edition, a player added or joining by
+ * invite). `regs` are every registration the person has, under any of their player records, with
+ * `playerId` set to the same id for all of them. The answer is a squad place (as their main club
+ * when it's their first club here, otherwise a second club), or a hold with the reason.
+ * `canChoose`: the hold is about having more than one club here, which the player settles by
+ * choosing their clubs; other holds need a league admin.
+ */
+export function registrationCheck(args: {
+  playerId: string;
+  teamId: string;
+  league: LeagueRef;
+  leagues: LeagueRef[];
+  regs: RegistrationRef[];
+  teamName?: (teamId: string) => string;
+  playerBirthDate?: string;
+  leagueStartsOn?: string;
+  now?: Date;
+}): { ok: true; primary: boolean } | { ok: false; reason: string; canChoose: boolean } {
+  const { league, playerId, teamId, regs } = args;
+  const name = (id: string) => args.teamName?.(id) ?? 'another club';
+  const rules = league.playerRules;
+  const here = regs.filter((r) => r.playerId === playerId && r.competitionId === league.id && r.status === 'active' && r.teamId !== teamId);
+  const clubs = [...new Set(here.map((r) => r.teamId))];
+  if (clubs.length) {
+    const already = clubs.map(name).join(' and ');
+    if (!rules.multiClub.allowed) return { ok: false, reason: `Already plays for ${already} in ${league.name}, which allows one club per player`, canChoose: true };
+    if (clubs.length + 1 > rules.multiClub.maxClubs) return { ok: false, reason: `Already plays for ${already}; ${league.name} allows ${rules.multiClub.maxClubs} clubs per player`, canChoose: true };
+    const maxAge = rules.multiClub.maxAge;
+    if (maxAge !== undefined) {
+      if (!args.playerBirthDate) return { ok: false, reason: `Already plays for ${already}. A second club here is for players aged ${maxAge} or under, and there's no date of birth on record`, canChoose: true };
+      const on = args.leagueStartsOn ?? (args.now ?? new Date()).toISOString();
+      const age = ageOn(args.playerBirthDate, on);
+      if (age > maxAge) return { ok: false, reason: `Already plays for ${already}. A second club here is for players aged ${maxAge} or under; they're ${age}`, canChoose: true };
+    }
+  }
+  const clash = otherLeagueConflicts(playerId, league, args.leagues, regs)[0];
+  if (clash) return { ok: false, reason: clash.reason, canChoose: false };
+  return { ok: true, primary: clubs.length === 0 };
+}

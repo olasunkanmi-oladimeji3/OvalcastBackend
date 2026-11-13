@@ -6,6 +6,8 @@
 
 export interface Messenger {
   sendCode(to: string, code: string, purpose: 'verify' | 'reset'): Promise<void>;
+  /** Any other email (club invitations): plain text, from EMAIL_FROM. Logged instead when no provider is set. */
+  sendEmail(to: string, subject: string, body: string): Promise<void>;
 }
 
 const text = (code: string, purpose: 'verify' | 'reset') =>
@@ -46,24 +48,24 @@ const twilio = (to: string, body: string) =>
 
 const subject = (purpose: 'verify' | 'reset') => (purpose === 'verify' ? 'Your Ovalcast code' : 'Reset your Ovalcast password');
 
-const postmark = (to: string, purpose: 'verify' | 'reset', body: string) =>
+const postmark = (to: string, subjectLine: string, body: string) =>
   post(
     'https://api.postmarkapp.com/email',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Postmark-Server-Token': process.env.POSTMARK_SERVER_TOKEN ?? '' },
-      body: JSON.stringify({ From: process.env.EMAIL_FROM, To: to, Subject: subject(purpose), TextBody: body, MessageStream: 'outbound' }),
+      body: JSON.stringify({ From: process.env.EMAIL_FROM, To: to, Subject: subjectLine, TextBody: body, MessageStream: 'outbound' }),
     },
     'Postmark',
   );
 
-const resend = (to: string, purpose: 'verify' | 'reset', body: string) =>
+const resend = (to: string, subjectLine: string, body: string) =>
   post(
     'https://api.resend.com/emails',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-      body: JSON.stringify({ from: process.env.EMAIL_FROM, to, subject: subject(purpose), text: body }),
+      body: JSON.stringify({ from: process.env.EMAIL_FROM, to, subject: subjectLine, text: body }),
     },
     'Resend',
   );
@@ -78,13 +80,19 @@ export const messenger: Messenger = {
     const body = text(code, purpose);
     if (to.includes('@')) {
       const p = emailProvider();
-      if (p === 'postmark') return postmark(to, purpose, body);
-      if (p === 'resend') return resend(to, purpose, body);
+      if (p === 'postmark') return postmark(to, subject(purpose), body);
+      if (p === 'resend') return resend(to, subject(purpose), body);
     } else {
       const p = smsProvider();
       if (p === 'termii') return termii(to, body);
       if (p === 'twilio') return twilio(to, body);
     }
     console.log(`[messaging] ${purpose} code for ${to}: ${code}`);
+  },
+  async sendEmail(to, subjectLine, body) {
+    const p = emailProvider();
+    if (p === 'postmark') return postmark(to, subjectLine, body);
+    if (p === 'resend') return resend(to, subjectLine, body);
+    console.log(`[messaging] email to ${to}: ${subjectLine}\n${body}`);
   },
 };
