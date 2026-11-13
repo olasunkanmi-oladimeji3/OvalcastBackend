@@ -8,8 +8,8 @@ services:
     plan: free # starter (or above) for production: free instances sleep when idle
     # --include=dev: NODE_ENV=production would otherwise skip the build tools (esbuild, prisma).
     buildCommand: npm ci --include=dev && npx prisma generate && npm run build
-    # Migrations before the new version takes traffic, over DIRECT_DATABASE_URL (prisma.config.ts).
-    preDeployCommand: npm run db:deploy
+    # Migrations, then the reference data (countries and cities), before the new version takes traffic.
+    preDeployCommand: npm run db:deploy && npm run db:reference
     startCommand: npm start
     healthCheckPath: /health/ready
     envVars:

@@ -18,7 +18,8 @@
     "jobs": "node scripts/build.mjs && node --enable-source-maps dist/jobs.js",
     "worker": "node --enable-source-maps dist/worker.js",
     "db:check": "tsx scripts/db-check.ts",
-    "db:setup": "prisma migrate deploy && tsx scripts/db-check.ts"
+    "db:setup": "prisma migrate deploy && tsx scripts/reference-data.ts && tsx scripts/db-check.ts",
+    "db:reference": "tsx scripts/reference-data.ts"
   },
   "keywords": [],
   "author": "",
