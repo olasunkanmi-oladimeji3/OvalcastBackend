@@ -156,3 +156,22 @@ export async function tellResult(m: Match, setup: MatchSetup, state: MatchState,
   const plain = new Set([...people.officials, ...people.followers, ...both].filter((u) => !told.has(u)));
   await notify(await wanting(plain, 'results'), { kind: 'result', title: m.result.text, body: [`${teamName(m.homeTeamId)} v ${teamName(m.awayTeamId)}.`, pom].filter(Boolean).join(' '), link });
 }
+
+/**
+ * A match has just gone live: followers of either club or the league hear it, once, with a link to
+ * follow ball by ball (and to watch, if it's being streamed).
+ */
+export async function tellLive(m: Match) {
+  const claimed = await prisma.match.updateMany({ where: { id: m.id, NOT: { remindersSent: { has: 'live' } } }, data: { remindersSent: { push: 'live' } } });
+  if (!claimed.count) return;
+  const people = await matchPeople(m);
+  const inIt = new Set([...people.home, ...people.away, ...people.officials]);
+  const teams = new Map((await prisma.team.findMany({ where: { id: { in: [m.homeTeamId, m.awayTeamId] } }, select: { id: true, name: true } })).map((t) => [t.id, t.name]));
+  const streaming = await prisma.stream.count({ where: { matchId: m.id, status: 'live' } });
+  await notify(await wanting(new Set([...people.followers].filter((u) => !inIt.has(u))), 'myClubs'), {
+    kind: 'match',
+    title: `Live now: ${teams.get(m.homeTeamId) ?? 'Home'} v ${teams.get(m.awayTeamId) ?? 'Away'}`,
+    body: streaming ? 'It’s being streamed. Watch, or follow ball by ball.' : 'Follow it ball by ball on Ovalcast.',
+    link: { pathname: '/match/[id]', params: { id: m.id } },
+  });
+}

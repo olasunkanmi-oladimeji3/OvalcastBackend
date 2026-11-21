@@ -1,6 +1,7 @@
 // Matches: friendlies, start and lock, the ball log, the live feed, the online
 // toss, eligibility and guests, and invitations to score or umpire.
 
+import { tellLive } from '~/services/matchNews';
 import { randomInt } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
@@ -276,6 +277,8 @@ export async function matchRoutes(app: FastifyInstance) {
     m.scores = [{ teamId: b.battingFirstTeamId, runs: 0, wickets: 0, balls: 0, allOut: false }];
     await saveMatch(m);
     await prisma.match.update({ where: { id: m.id }, data: { startedAt: new Date() } });
+    // Followers hear it's live (once); not waited on, so the scorer's phone isn't kept waiting.
+    void tellLive(m).catch((e) => req.log.error(e));
     publish(m.id, { type: 'status', match: m });
     void emitPartnerEvent('match.started', m.id, { homeTeamId: m.homeTeamId, awayTeamId: m.awayTeamId, battingFirstTeamId: m.battingFirstTeamId });
     return m;

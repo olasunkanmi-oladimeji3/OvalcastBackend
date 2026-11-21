@@ -207,6 +207,35 @@ export interface PlayerCareer {
   recent: { matchId: ID; against: ID; runs?: number; balls?: number; wickets?: number; conceded?: number; date: ISODate }[];
 }
 
+/** One player's season: figures, awards and their best match, for the shareable season review. */
+export interface PlayerSeason {
+  playerId: ID;
+  name: string;
+  teamId: ID;
+  /** The calendar year the season covers, and every year they've played in. */
+  year: number;
+  years: number[];
+  matches: number;
+  batting: { innings: number; runs: number; balls: number; notOuts: number; high: number; fifties: number; hundreds: number; fours: number; sixes: number };
+  bowling: { balls: number; runs: number; wickets: number; best: string };
+  fielding: { catches: number; runOuts: number; stumpings: number };
+  /** Player of the match awards: confirmed by the organiser, or suggested where none was. */
+  playerOfMatch: number;
+  /** Their highest-impact match of the season. */
+  best?: { matchId: ID; date: ISODate; against: ID; runs?: number; balls?: number; wickets?: number; conceded?: number; result?: string };
+}
+
+/** A league's season at a glance, for its admins: matches, money and the most-watched streams. */
+export interface LeagueReport {
+  competitionId: ID;
+  currency: string;
+  matches: { total: number; played: number; live: number; scheduled: number; abandoned: number };
+  entryFees: { fee: number; clubs: number; paid: number; collected: number; paidInCash: number; owed: number };
+  streams: { streamed: number; views: number; passes: number; donations: number; gross: number };
+  /** Matches with the most stream opens, then the most money. */
+  topStreams: { matchId: ID; homeTeamId: ID; awayTeamId: ID; startsAt: ISODate; views: number; passes: number; donations: number; gross: number }[];
+}
+
 export interface Region {
   id: ID;
   name: string;
@@ -1455,6 +1484,12 @@ export interface OvalcastApi {
   listPlayers(teamId: ID): Promise<Player[]>;
   // GET /players/:id/career
   getPlayerCareer(playerId: ID): Promise<PlayerCareer>;
+  /** GET /players/:id/season?year= : the season review (the latest season they played, if no year). */
+  getPlayerSeason(playerId: ID, year?: number): Promise<PlayerSeason>;
+  /** GET /competitions/:id/report : for the league's admins. */
+  getLeagueReport(competitionId: ID): Promise<LeagueReport>;
+  /** POST /streams/:id/view : counts one opening of a stream. */
+  countStreamView(streamId: ID): Promise<{ ok: true }>;
 
   // GET /matches?status=&competitionId=&teamId=
   listMatches(params?: { status?: MatchStatus[]; competitionId?: ID; teamId?: ID }): Promise<Match[]>;

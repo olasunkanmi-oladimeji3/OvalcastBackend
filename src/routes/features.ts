@@ -223,6 +223,14 @@ export async function featureRoutes(app: FastifyInstance) {
     };
   });
 
+  // Someone opened the stream (live or replay): counted for the league's season report. No sign-in;
+  // a counter only, so a repeat open just counts again.
+  app.post<{ Params: { id: string } }>('/streams/:id/view', async (req) => {
+    const r = await prisma.stream.updateMany({ where: { id: req.params.id }, data: { views: { increment: 1 } } });
+    if (!r.count) throw notFound('Stream');
+    return { ok: true as const };
+  });
+
   app.post<{ Params: { id: string } }>('/streams/:id/end', async (req) => {
     const user = requireUser(req);
     const s = await prisma.stream.findUnique({ where: { id: req.params.id }, include: { match: { select: { competitionId: true } } } });

@@ -3,7 +3,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import type { Competition, Leaderboards, Match, Payment, SeriesSummary, Standings, Transfer } from '@/api/types';
+import type { Competition, LeagueReport, Leaderboards, Match, Payment, SeriesSummary, Standings, Transfer } from '@/api/types';
 import { buildBracket, canTransfer, fitGroups, matchAwards, registrationCheck, roundRobin, standings, tableResult, transferOpen } from '@/engine';
 import { entryShareFor } from '~/lib/shares';
 import { prisma, toJson } from '~/db/client';
@@ -152,6 +152,43 @@ export async function competitionRoutes(app: FastifyInstance) {
       economy: top((f) => (f.runsConceded / f.ballsBowled) * 6, (f) => `${Math.floor(f.ballsBowled / 6)} overs`, (f) => f.ballsBowled >= 36, true),
       fielding: top((f) => f.catches + f.runOuts + f.stumpings, (f) => [f.catches ? `${f.catches} ct` : '', f.runOuts ? `${f.runOuts} ro` : '', f.stumpings ? `${f.stumpings} st` : ''].filter(Boolean).join(', '), (f) => f.catches + f.runOuts + f.stumpings > 0),
       playerOfMatch: [...poms].filter(([pid]) => teamOf(pid)).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([pid, n]) => ({ playerId: pid, teamId: teamOf(pid), value: n, detail: `${figs.get(pid)?.matches ?? n} matches` })),
+    };
+  });
+
+  // The league's season at a glance, for its admins and deputy approvers: matches, entry fees,
+  // stream money, and the most-watched streams.
+  app.get<{ Params: { id: string } }>('/competitions/:id/report', async (req): Promise<LeagueReport> => {
+    const user = requireUser(req);
+    const c = await comp(req.params.id);
+    if (!mayApprovePlayers(user, c.orgId)) throw forbidden('The season report is for the league’s admins');
+    const org = await prisma.organisation.findUniqueOrThrow({ where: { id: c.orgId }, select: { currency: true } });
+    const matches = await prisma.match.findMany({ where: { competitionId: c.id }, select: { id: true, status: true, homeTeamId: true, awayTeamId: true, startsAt: true } });
+    const count = (...st: string[]) => matches.filter((m) => st.includes(m.status)).length;
+    const entries = (await prisma.entry.findMany({ where: { competitionId: c.id, status: 'accepted' } })).map(toEntry);
+    const paid = entries.filter((e) => e.payment?.status === 'paid');
+    const ids = matches.map((m) => m.id);
+    const [streams, sales] = await Promise.all([
+      prisma.stream.findMany({ where: { matchId: { in: ids } }, select: { matchId: true, views: true } }),
+      prisma.passSale.findMany({ where: { matchId: { in: ids } }, select: { matchId: true, passes: true, donations: true, gross: true } }),
+    ]);
+    const per = new Map<string, { views: number; passes: number; donations: number; gross: number }>();
+    const row = (id: string) => per.get(id) ?? per.set(id, { views: 0, passes: 0, donations: 0, gross: 0 }).get(id)!;
+    for (const st of streams) row(st.matchId).views += st.views;
+    for (const sl of sales) Object.assign(row(sl.matchId), { passes: row(sl.matchId).passes + sl.passes, donations: row(sl.matchId).donations + sl.donations, gross: row(sl.matchId).gross + sl.gross });
+    const all = [...per.values()];
+    const sum = (k: 'views' | 'passes' | 'donations' | 'gross') => all.reduce((a, r) => a + r[k], 0);
+    const byId = new Map(matches.map((m) => [m.id, m]));
+    return {
+      competitionId: c.id,
+      currency: org.currency,
+      matches: { total: matches.length, played: count('completed'), live: count('live', 'inningsBreak'), scheduled: count('scheduled', 'toss'), abandoned: count('abandoned') },
+      entryFees: { fee: c.entryFee, clubs: entries.length, paid: paid.length, collected: paid.reduce((a, e) => a + (e.payment?.amount ?? 0), 0), paidInCash: paid.filter((e) => e.payment?.method === 'cash').length, owed: c.entryFee * (entries.length - paid.length) },
+      streams: { streamed: new Set(streams.map((st) => st.matchId)).size, views: sum('views'), passes: sum('passes'), donations: sum('donations'), gross: sum('gross') },
+      topStreams: [...per]
+        .filter(([, r]) => r.views || r.gross)
+        .sort((a, b) => b[1].views - a[1].views || b[1].gross - a[1].gross)
+        .slice(0, 5)
+        .map(([matchId, r]) => ({ matchId, homeTeamId: byId.get(matchId)!.homeTeamId, awayTeamId: byId.get(matchId)!.awayTeamId, startsAt: byId.get(matchId)!.startsAt.toISOString(), ...r })),
     };
   });
 

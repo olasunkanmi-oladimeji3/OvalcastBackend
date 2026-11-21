@@ -546,6 +546,8 @@ model Stream {
   status         String
   playbackUrl    String    @map("playback_url")
   viewers        Int       @default(0)
+  /// Times the stream was opened (live or replay), for the league's season report.
+  views          Int       @default(0)
   latencySeconds Int       @map("latency_seconds")
   /// phone | encoder
   source         String

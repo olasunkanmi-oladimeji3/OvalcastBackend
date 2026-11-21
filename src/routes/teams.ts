@@ -2,7 +2,8 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import type { Player, PlayerCareer, StaffMember, User } from '@/api/types';
+import type { Player, PlayerCareer, PlayerSeason, StaffMember, User } from '@/api/types';
+import { matchAwards } from '@/engine';
 import { json, prisma, toJson } from '~/db/client';
 import { requireUser } from '~/lib/auth';
 import { badRequest, conflict, forbidden, notFound } from '~/lib/errors';
@@ -146,6 +147,46 @@ export async function teamRoutes(app: FastifyInstance) {
     if (!inv) throw notFound('Invite');
     if (!isClubAdmin(user, inv.teamId)) throw forbidden('Only a club admin can cancel invites');
     return toInvite(await prisma.playerInvite.update({ where: { id: inv.id }, data: { status: 'cancelled' } }));
+  });
+
+  // ------------------------------------------------------------- season review
+  // One calendar year: figures, player of the match awards, and the match with the highest impact.
+  app.get<{ Params: { id: string } }>('/players/:id/season', async (req): Promise<PlayerSeason> => {
+    const p = await prisma.player.findUnique({ where: { id: req.params.id } });
+    if (!p) throw notFound('Player');
+    const { year: asked } = z.object({ year: z.coerce.number().int().min(2000).max(2100).optional() }).parse(req.query);
+    const aliases = new Set(await playerAliases(p.id));
+    const mine = (await replayedMatches()).filter((r) => r.setup.teams.some((t) => [...t.players, ...(t.substitutes ?? [])].some((x) => aliases.has(x.id))));
+    const yearOf = (iso: string) => Number(iso.slice(0, 4));
+    const years = [...new Set(mine.map((r) => yearOf(r.match.startsAt)))].sort((a, b) => b - a);
+    const year = asked ?? years[0] ?? new Date().getFullYear();
+    const season = mine.filter((r) => yearOf(r.match.startsAt) === year);
+    const figs = aggregate(season);
+    const f = mergeFigures([...aliases].map((id) => figs.get(id)).filter((x): x is Figures => !!x));
+    let playerOfMatch = 0;
+    let best: PlayerSeason['best'];
+    let bestImpact = -Infinity;
+    for (const r of season) {
+      const awards = matchAwards(r.setup, r.state, r.events);
+      const done = r.match.status === 'completed';
+      const pom = r.match.playerOfMatchId ?? (done ? awards.playerOfMatch?.playerId : undefined);
+      if (pom && aliases.has(pom)) playerOfMatch += 1;
+      const impact = awards.impacts.find((x) => aliases.has(x.playerId));
+      if (!impact || impact.total <= bestImpact) continue;
+      bestImpact = impact.total;
+      const id = impact.playerId;
+      const bat = r.state.innings.flatMap((i) => i.batters).find((b) => b.playerId === id);
+      const bowl = r.state.innings.flatMap((i) => i.bowlers).find((b) => b.playerId === id);
+      const side = r.setup.teams.find((t) => [...t.players, ...(t.substitutes ?? [])].some((x) => x.id === id))?.id;
+      best = { matchId: r.match.id, date: r.match.startsAt, against: side === r.match.homeTeamId ? r.match.awayTeamId : r.match.homeTeamId, ...(bat ? { runs: bat.runs, balls: bat.balls } : {}), ...(bowl && bowl.balls ? { wickets: bowl.wickets, conceded: bowl.runs } : {}), ...(r.match.result?.text ? { result: r.match.result.text } : {}) };
+    }
+    return {
+      playerId: p.id, name: masked(toPlayer(p), req.user).name, teamId: p.teamId, year, years, matches: f?.matches ?? 0,
+      batting: { innings: f?.innings ?? 0, runs: f?.runs ?? 0, balls: f?.balls ?? 0, notOuts: f?.notOuts ?? 0, high: f?.high ?? 0, fifties: f?.fifties ?? 0, hundreds: f?.hundreds ?? 0, fours: f?.fours ?? 0, sixes: f?.sixes ?? 0 },
+      bowling: { balls: f?.ballsBowled ?? 0, runs: f?.runsConceded ?? 0, wickets: f?.wickets ?? 0, best: f?.best ? `${f.best.wickets}/${f.best.runs}` : '–' },
+      fielding: { catches: f?.catches ?? 0, runOuts: f?.runOuts ?? 0, stumpings: f?.stumpings ?? 0 },
+      playerOfMatch, best,
+    };
   });
 
   // ------------------------------------------------------------------- careers
