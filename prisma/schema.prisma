@@ -157,6 +157,8 @@ model Organisation {
   seasonMoves       Json      @default("[]") @map("season_moves")
   /// organisation (by contract) | free; without a contract, leagues use their admins' own plans.
   plan              String    @default("free")
+  /// Put on the Organisation plan by Ovalcast staff (a contract): it doesn't lapse with a subscription.
+  planContract      Boolean   @default(false) @map("plan_contract")
   /// league | association | festival | school | academy | corporate
   kind              String    @default("league")
   logoUrl           String?   @map("logo_url")
@@ -715,10 +717,15 @@ model Subscription {
   cancelAtPeriodEnd Boolean  @default(false) @map("cancel_at_period_end")
   /// flutterwave | appStore | playStore
   provider          String
+  /// Set for the Organisation plan: the organisation it covers (userId is the admin who paid).
+  orgId             String?  @map("org_id")
+  /// The renewal date a reminder was last sent for, so each period gets one reminder.
+  remindedFor       DateTime? @map("reminded_for") @db.Timestamptz
   user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, status])
   @@index([status, renewsAt])
+  @@index([orgId])
   @@map("subscriptions")
 }
 

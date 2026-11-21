@@ -75,7 +75,7 @@ export async function billingRoutes(app: FastifyInstance) {
     const adminOrgIds = user.memberships.filter((m) => m.orgId && (m.role === 'leagueAdmin' || m.role === 'owner')).map((m) => m.orgId!);
     const orgs = await prisma.organisation.findMany({ where: { id: { in: adminOrgIds } }, select: { id: true, name: true, plan: true } });
     const own = orgs.filter((o) => o.plan !== 'organisation').map((o) => o.id);
-    const sub = await prisma.subscription.findFirst({ where: { userId: user.id, status: { not: 'cancelled' } }, orderBy: { renewsAt: 'desc' } });
+    const sub = await prisma.subscription.findFirst({ where: { userId: user.id, orgId: null, status: { not: 'cancelled' } }, orderBy: { renewsAt: 'desc' } });
     return {
       plan,
       subscription: sub ? toSubscription(sub) : undefined,
@@ -97,7 +97,7 @@ export async function billingRoutes(app: FastifyInstance) {
 
   app.delete('/me/subscription', async (req) => {
     const user = requireUser(req);
-    const sub = await prisma.subscription.findFirst({ where: { userId: user.id, status: 'active' } });
+    const sub = await prisma.subscription.findFirst({ where: { userId: user.id, orgId: null, status: 'active' } });
     if (!sub) throw notFound('Subscription');
     // Pro stays on to the end of the period; the payment plan stops renewing.
     return toSubscription(await prisma.subscription.update({ where: { id: sub.id }, data: { cancelAtPeriodEnd: true } }));

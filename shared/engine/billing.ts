@@ -36,6 +36,15 @@ export function proPrice(country?: string): { currency: PriceCurrency; monthly: 
   return country === 'Nigeria' ? { currency: 'NGN', monthly: 1500, yearly: 15000 } : { currency: 'USD', monthly: 3, yearly: 30 };
 }
 
+/**
+ * The Organisation plan (unlimited leagues, entry fees online, branding, the API and website embeds):
+ * ₦25,000 a month in Nigeria, $25 a month everywhere else. A year is 15% off twelve months.
+ */
+export function organisationPrice(country?: string): { currency: PriceCurrency; monthly: number; yearly: number } {
+  const [currency, monthly] = country === 'Nigeria' ? (['NGN', 25000] as const) : (['USD', 25] as const);
+  return { currency, monthly, yearly: Math.round(monthly * 12 * 0.85) };
+}
+
 export function renewsOn(from: Date, interval: BillingInterval): Date {
   const d = new Date(from);
   if (interval === 'monthly') d.setUTCMonth(d.getUTCMonth() + 1);

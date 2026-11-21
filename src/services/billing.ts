@@ -18,12 +18,12 @@ import { getMatch } from '~/services/matches';
 import { TtlCache, registerCache } from '~/lib/cache';
 import { platformShareFor } from '~/lib/shares';
 
-export type CheckoutKind = 'entry' | 'pro' | 'topUp' | 'pass' | 'credits' | 'donation';
+export type CheckoutKind = 'entry' | 'pro' | 'topUp' | 'pass' | 'credits' | 'donation' | 'organisation';
 
 // ------------------------------------------------------------------ plans
 
 export async function userPlan(userId: string, now = new Date()): Promise<PlanId> {
-  const sub = await prisma.subscription.findFirst({ where: { userId, status: { not: 'cancelled' }, renewsAt: { gt: now } } });
+  const sub = await prisma.subscription.findFirst({ where: { userId, orgId: null, status: { not: 'cancelled' }, renewsAt: { gt: now } } });
   return sub ? 'pro' : 'free';
 }
 
@@ -117,12 +117,25 @@ export async function completeCheckout(id: string, charge: { providerId: string;
 
   if (c.kind === 'pro') {
     const interval = meta.interval as BillingInterval;
-    const current = await prisma.subscription.findFirst({ where: { userId: c.userId, status: { not: 'cancelled' } }, orderBy: { renewsAt: 'desc' } });
+    const current = await prisma.subscription.findFirst({ where: { userId: c.userId, orgId: null, status: { not: 'cancelled' } }, orderBy: { renewsAt: 'desc' } });
     // A renewal extends from the current end; a new subscription starts now.
     const from = current && current.renewsAt > now ? current.renewsAt : now;
     if (current) await prisma.subscription.update({ where: { id: current.id }, data: { status: 'active', interval, amount: c.amount, currency: c.currency, renewsAt: renewsOn(from, interval), cancelAtPeriodEnd: false } });
     else await prisma.subscription.create({ data: { id: newId('sub'), userId: c.userId, plan: 'pro', interval, status: 'active', currency: c.currency, amount: c.amount, startedAt: now, renewsAt: renewsOn(now, interval), provider: 'flutterwave' } });
     await notify(c.userId, { kind: 'payment', title: 'Welcome to Ovalcast Pro', body: `Reference ${reference}. Pro analysis, higher limits and paid streams are on.`, link: { pathname: '/plans' } });
+  }
+
+  if (c.kind === 'organisation' && c.refId) {
+    // The Organisation plan: a renewal extends from the current end; a first payment starts now.
+    const interval = meta.interval as BillingInterval;
+    const orgId = c.refId;
+    const current = await prisma.subscription.findFirst({ where: { orgId, status: { not: 'cancelled' } }, orderBy: { renewsAt: 'desc' } });
+    const from = current && current.renewsAt > now ? current.renewsAt : now;
+    if (current) await prisma.subscription.update({ where: { id: current.id }, data: { status: 'active', interval, amount: c.amount, currency: c.currency, renewsAt: renewsOn(from, interval), cancelAtPeriodEnd: false } });
+    else await prisma.subscription.create({ data: { id: newId('sub'), userId: c.userId, orgId, plan: 'organisation', interval, status: 'active', currency: c.currency, amount: c.amount, startedAt: now, renewsAt: renewsOn(now, interval), provider: 'flutterwave' } });
+    const org = await prisma.organisation.update({ where: { id: orgId }, data: { plan: 'organisation' } });
+    const admins = (await prisma.membership.findMany({ where: { orgId, role: { in: ['owner', 'leagueAdmin'] } }, select: { userId: true } })).map((m) => m.userId);
+    await notify(admins, { kind: 'payment', title: current ? `${org.name}: Organisation plan renewed` : `${org.name} is on the Organisation plan`, body: `Reference ${reference}. Unlimited leagues, online entry fees, your branding, website embeds and the API are on.`, link: { pathname: '/organisation/[id]', params: { id: orgId } } });
   }
 
   if (c.kind === 'topUp') {

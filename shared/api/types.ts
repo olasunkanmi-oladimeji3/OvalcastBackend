@@ -1164,6 +1164,15 @@ export interface ApiClientSummary {
   webhooks: { id: ID; url: string; events: string[]; active: boolean }[];
 }
 
+/** An organisation's plan as its admins see it: Free or Organisation, how it's paid, and the price. */
+export interface OrganisationPlanStatus {
+  plan: 'free' | 'organisation';
+  /** Put on the plan by Ovalcast (a contract): nothing to pay in the app. */
+  contract: boolean;
+  price: { currency: Currency; monthly: number; yearly: number };
+  subscription?: { interval: 'monthly' | 'yearly'; status: 'active' | 'pastDue'; renewsAt: ISODate; cancelAtPeriodEnd: boolean; amount: number; currency: string };
+}
+
 /** An admin of an organisation or a club. */
 export interface AdminMember {
   userId: ID;
@@ -1799,6 +1808,12 @@ export interface OvalcastApi {
 
   // Ovalcast staff console. Staff only.
   staffListOrganisations(): Promise<StaffOrgSummary[]>;
+  /** GET/POST/DELETE /organisations/:id/plan : the Organisation plan, subscribed and renewed by its admins. */
+  getOrganisationPlan(orgId: ID): Promise<OrganisationPlanStatus>;
+  subscribeOrganisation(orgId: ID, interval: 'monthly' | 'yearly', method: string): Promise<{ status: 'paid' | 'redirect'; reference: string; link?: string }>;
+  cancelOrganisationPlan(orgId: ID): Promise<OrganisationPlanStatus>;
+  /** POST /organisations/:id/api-clients : a new key, shown once. Needs the Organisation plan. */
+  createApiClient(orgId: ID, name: string): Promise<IssuedApiKey>;
   staffSetPlan(orgId: ID, plan: 'free' | 'organisation'): Promise<Organisation>;
   staffListCertificates(): Promise<PendingCertificate[]>;
   staffReviewCertificate(certificateId: ID, decision: 'verified' | 'rejected'): Promise<PendingCertificate>;

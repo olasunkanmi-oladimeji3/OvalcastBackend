@@ -21,6 +21,7 @@ import { storageRoot } from './lib/storage';
 import { authRoutes } from './routes/auth';
 import { competitionRoutes } from './routes/competitions';
 import { marketRoutes } from './routes/market';
+import { orgPlanRoutes } from './routes/orgPlan';
 import { financeRoutes, webhookRoutes } from './routes/finance';
 import { billingRoutes } from './routes/billing';
 import { featureRoutes } from './routes/features';
@@ -156,6 +157,7 @@ export async function buildApp() {
       await api.register(teamRoutes);
       await api.register(competitionRoutes);
       await api.register(marketRoutes);
+      await api.register(orgPlanRoutes);
       await api.register(matchRoutes);
       await api.register(peopleRoutes);
       await api.register(financeRoutes);

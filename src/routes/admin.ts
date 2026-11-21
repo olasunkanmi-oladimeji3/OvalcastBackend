@@ -604,7 +604,8 @@ export async function adminRoutes(app: FastifyInstance) {
   app.put<{ Params: { id: string } }>('/staff/organisations/:id/plan', async (req) => {
     const staff = requireStaff(req);
     const { plan } = z.object({ plan: z.enum(['free', 'organisation']) }).parse(req.body);
-    const o = await prisma.organisation.update({ where: { id: req.params.id }, data: { plan } });
+    // Staff set the plan by contract: it doesn't lapse with a subscription.
+    const o = await prisma.organisation.update({ where: { id: req.params.id }, data: { plan, planContract: plan === 'organisation' } });
     const admins = await orgAdmins(o.id);
     await notify(admins.map((a) => a.userId), { kind: 'payment', title: plan === 'organisation' ? `${o.name} is on the Organisation plan` : `${o.name} is back on the Free plan`, body: plan === 'organisation' ? 'Unlimited competitions, online entry fees, several admins and the API are on.' : 'Plan limits apply again.' });
     await logStaff(staff, 'setPlan', 'organisation', o.id, plan);
