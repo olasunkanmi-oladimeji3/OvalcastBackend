@@ -6,11 +6,14 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import type { ApiClientSummary, OrganisationPlanStatus } from '@/api/types';
+import { randomBytes } from 'node:crypto';
+import type { ApiClientSummary, OrganisationPlanStatus, WebhookDeliverySummary } from '@/api/types';
 import { organisationPrice } from '@/engine';
-import { json, prisma } from '~/db/client';
+import { json, prisma, toJson } from '~/db/client';
 import { requireUser } from '~/lib/auth';
-import { conflict, forbidden, notFound } from '~/lib/errors';
+import { badRequest, conflict, forbidden, notFound } from '~/lib/errors';
+import { urlProblem } from '~/lib/safeFetch';
+import { PARTNER_EVENTS } from '~/services/partners';
 import { newId } from '~/lib/ids';
 import { isLeagueAdmin } from '~/lib/repo';
 import { startCheckout } from '~/services/billing';
@@ -72,5 +75,57 @@ export async function orgPlanRoutes(app: FastifyInstance) {
     const c = await prisma.apiClient.create({ data: { id: newId('api'), orgId: req.params.id, name, keyHash: hash, keyPrefix: prefix, sandbox: false }, include: { webhooks: true } });
     const client: ApiClientSummary = { id: c.id, name: c.name, keyPrefix: c.keyPrefix, sandbox: false, createdAt: c.createdAt.toISOString(), requestsThisMonth: 0, webhooks: c.webhooks.map((w) => ({ id: w.id, url: w.url, events: json<string[]>(w.events), active: w.active })) };
     return { client, key };
+  });
+
+  // ---------------------------------------------------------------- webhooks
+  // The same webhooks a key can register through the API, set up here by the organisation's admins.
+  const ownClient = async (orgId: string, clientId: string) => {
+    const c = await prisma.apiClient.findFirst({ where: { id: clientId, orgId, revokedAt: null } });
+    if (!c) throw notFound('API key');
+    return c;
+  };
+
+  app.post<{ Params: { id: string; clientId: string } }>('/organisations/:id/api-clients/:clientId/webhooks', async (req) => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can add webhooks');
+    const b = z.object({ url: z.string().trim().url('Give the full address, starting https://'), events: z.array(z.enum(PARTNER_EVENTS)).min(1, 'Choose at least one event') }).parse(req.body);
+    await ownClient(req.params.id, req.params.clientId);
+    if (!b.url.startsWith('https://')) throw badRequest('Use an https:// address, so deliveries are encrypted');
+    const problem = await urlProblem(b.url);
+    if (problem) throw badRequest(`That address can’t be used: ${problem}`);
+    if ((await prisma.partnerWebhook.count({ where: { clientId: req.params.clientId } })) >= 5) throw conflict('A key can have 5 webhooks. Remove one first');
+    const secret = `whsec_${randomBytes(24).toString('base64url')}`;
+    const w = await prisma.partnerWebhook.create({ data: { id: newId('wh'), clientId: req.params.clientId, url: b.url, secret, events: toJson(b.events) } });
+    return { id: w.id, url: w.url, events: b.events, active: true, secret };
+  });
+
+  app.delete<{ Params: { id: string; clientId: string; webhookId: string } }>('/organisations/:id/api-clients/:clientId/webhooks/:webhookId', async (req) => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can remove webhooks');
+    await ownClient(req.params.id, req.params.clientId);
+    const gone = await prisma.partnerWebhook.deleteMany({ where: { id: req.params.webhookId, clientId: req.params.clientId } });
+    if (!gone.count) throw notFound('Webhook');
+    return { ok: true as const };
+  });
+
+  // A test delivery (event "ping"), so the website's developer can check their endpoint and signature.
+  app.post<{ Params: { id: string; clientId: string; webhookId: string } }>('/organisations/:id/api-clients/:clientId/webhooks/:webhookId/test', async (req) => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can send a test');
+    await ownClient(req.params.id, req.params.clientId);
+    const w = await prisma.partnerWebhook.findFirst({ where: { id: req.params.webhookId, clientId: req.params.clientId } });
+    if (!w) throw notFound('Webhook');
+    const payload = { id: newId('evt'), type: 'ping', createdAt: new Date().toISOString(), data: { message: 'A test from Ovalcast. Check the signature, then reply 2xx.' } };
+    await prisma.webhookDelivery.create({ data: { id: newId('dlv'), webhookId: w.id, event: 'ping', payload: toJson(payload), status: 'pending' } });
+    return { ok: true as const };
+  });
+
+  // The last 20 deliveries to a webhook: what was sent, and whether it got through.
+  app.get<{ Params: { id: string; clientId: string; webhookId: string } }>('/organisations/:id/api-clients/:clientId/webhooks/:webhookId/deliveries', async (req): Promise<WebhookDeliverySummary[]> => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can see deliveries');
+    await ownClient(req.params.id, req.params.clientId);
+    const rows = await prisma.webhookDelivery.findMany({ where: { webhookId: req.params.webhookId, webhook: { clientId: req.params.clientId } }, orderBy: { createdAt: 'desc' }, take: 20 });
+    return rows.map((d) => ({ id: d.id, event: d.event, status: d.status as WebhookDeliverySummary['status'], attempts: d.attempts, createdAt: d.createdAt.toISOString(), ...(d.deliveredAt ? { deliveredAt: d.deliveredAt.toISOString() } : {}), ...(d.lastError ? { lastError: d.lastError } : {}) }));
   });
 }

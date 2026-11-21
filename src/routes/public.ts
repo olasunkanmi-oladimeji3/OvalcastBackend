@@ -1,6 +1,7 @@
 // Organisations, regions and regional leaders, search, community posts,
 // notifications, streams and clips.
 
+import { recordingOf, videoConfigured } from '~/lib/video';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { LeaderRow, PostKind, RegionalLeaders } from '@/api/types';
@@ -130,14 +131,28 @@ export async function publicRoutes(app: FastifyInstance) {
 
   // ---------------------------------------------------------- streams, clips
   // Paid streams: the playback URL and clips go only to the host and pass holders. The score stays free.
-  const guard = async (s: P.Stream, userId?: string) => ((await mayWatch(userId, s.matchId)) ? s : { ...s, playbackUrl: '' });
+  const guard = async (s: P.Stream, userId?: string) => {
+    // Never the ingest key, its address or the live input: those are for whoever streams.
+    const { ingestKeyEnc: _k, ingestUrl: _u, liveInputId: _l, ...open } = s;
+    void _k; void _u; void _l;
+    return (await mayWatch(userId, s.matchId)) ? open : { ...open, playbackUrl: '' };
+  };
+  /** A finished stream plays its recording once the video service has it ready. */
+  const withReplay = async (s: P.Stream) => {
+    if (s.status !== 'ended' || !s.liveInputId || !videoConfigured() || !s.playbackUrl.includes(s.liveInputId)) return s;
+    const replay = await recordingOf(s.liveInputId).catch(() => undefined);
+    return replay ? prisma.stream.update({ where: { id: s.id }, data: { playbackUrl: replay } }) : s;
+  };
   app.get('/streams', async (req) => {
     const { status } = z.object({ status: z.enum(['live', 'ended', 'scheduled']).optional() }).parse(req.query);
     return Promise.all((await prisma.stream.findMany({ where: status ? { status } : {} })).map((s) => guard(s, req.user?.id)));
   });
   app.get<{ Params: { id: string } }>('/streams/:id', async (req) => {
     // Every watcher checks the stream every few seconds: one read shared between them.
-    const s = await streams.remember(req.params.id, 5_000, () => prisma.stream.findUnique({ where: { id: req.params.id } }));
+    const s = await streams.remember(req.params.id, 5_000, async () => {
+      const row = await prisma.stream.findUnique({ where: { id: req.params.id } });
+      return row ? withReplay(row) : row;
+    });
     if (!s) throw notFound('Stream');
     return guard(s, req.user?.id);
   });

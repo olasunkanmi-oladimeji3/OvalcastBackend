@@ -556,6 +556,10 @@ model Stream {
   streamer       String
   /// The video service's live input, which holds the ingest key.
   liveInputId    String?   @map("live_input_id")
+  /// The live input's RTMPS key from the video service, encrypted (lib/secrets). Shown only to whoever streams.
+  ingestKeyEnc   String?   @map("ingest_key_enc")
+  /// The video service's RTMPS address for this input.
+  ingestUrl      String?   @map("ingest_url")
   startedBy      String?   @map("started_by")
   /// Seconds the picture reached viewers, and seconds it was down, from the host's phone or the video service.
   liveSeconds    Int       @default(0) @map("live_seconds")
@@ -1172,4 +1176,19 @@ model MarketListing {
   @@index([competitionId, status])
   @@index([playerId])
   @@map("market_listings")
+}
+
+/// A phone that can be sent notifications: its Expo push token. Removed on sign-out, or when Expo
+/// says the app was uninstalled.
+model PushToken {
+  id         String   @id
+  userId     String   @map("user_id")
+  token      String   @unique
+  /// android | ios
+  platform   String
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.Timestamptz
+
+  @@index([userId])
+  @@map("push_tokens")
 }

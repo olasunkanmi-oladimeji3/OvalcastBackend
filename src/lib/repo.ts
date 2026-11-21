@@ -1,6 +1,7 @@
 // Row → API contract mappers and shared lookups. Routes return exactly the
 // shapes in mobile/src/api/types.ts, so the app and website need no changes.
 
+import { sendPush } from '~/lib/push';
 import type { AppNotification, Competition, CompetitionEntry, Match, Organisation, Player, Team, Transfer, User, UserSettings } from '@/api/types';
 import type * as P from '~/generated/prisma/client';
 import { Prisma, json, prisma, toJson } from '~/db/client';
@@ -226,8 +227,9 @@ export const isClubAdmin = (u: User | undefined, teamId?: string) => !!u && !!te
 export async function notify(userIds: string | string[], n: Omit<AppNotification, 'id' | 'at' | 'read' | 'userId'>) {
   const ids = [...new Set(Array.isArray(userIds) ? userIds : [userIds])];
   if (!ids.length) return;
-  // Production also fans out to push, SMS and WhatsApp according to each user's settings.
   await prisma.notification.createMany({ data: ids.map((userId) => ({ id: newId('n'), userId, kind: n.kind, title: n.title, body: n.body, link: toJson(n.link) })) });
+  // The same, as a phone notification (unless push is off in their settings). Not waited on.
+  void sendPush(ids, { title: n.title, body: n.body, data: { link: n.link ?? null, kind: n.kind } });
 }
 
 /** Everyone who approves a league's players: its admins and its deputy approvers. */

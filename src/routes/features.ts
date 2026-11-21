@@ -11,11 +11,12 @@ import type * as P from '~/generated/prisma/client';
 import { json, Prisma, prisma, toJson } from '~/db/client';
 import { requireUser } from '~/lib/auth';
 import { sha256, sixDigitCode } from '~/lib/crypto';
-import { badRequest, conflict, forbidden, notFound } from '~/lib/errors';
+import { ApiError, badRequest, conflict, forbidden, notFound } from '~/lib/errors';
 import { newId } from '~/lib/ids';
 import { publish } from '~/lib/live';
 import { isClubAdmin, isLeagueAdmin, notify, toCompetition, toMatch, toOrg } from '~/lib/repo';
-import { seal } from '~/lib/secrets';
+import { open as openSecret, seal } from '~/lib/secrets';
+import { addRestream, closeLiveInput, createLiveInput, videoConfigured } from '~/lib/video';
 import { storage } from '~/lib/storage';
 import { requireFeature } from '~/services/billing';
 import { forgetDevice, getMatch, saveMatch } from '~/services/matches';
@@ -203,8 +204,23 @@ export async function featureRoutes(app: FastifyInstance) {
       const row = await tx.stream.create({ data: { id: newId('stream'), matchId: m.id, status: 'live', playbackUrl: `https://customer-dev.cloudflarestream.com/${liveInputId}/manifest/video.m3u8`, viewers: 0, latencySeconds: source === 'phone' ? 5 : 8, source, streamer: user.name, liveInputId, startedBy: user.id } });
       return { stream: row, created: true };
     });
+    let s2 = s;
+    if (created && videoConfigured()) {
+      // A Cloudflare Stream live input for this stream: RTMPS in, HLS out, recorded for the replay.
+      try {
+        const input = await createLiveInput(`${m.id} ${s.id}`);
+        s2 = await prisma.stream.update({ where: { id: s.id }, data: { liveInputId: input.uid, playbackUrl: input.playbackUrl, ingestUrl: input.rtmps.url, ingestKeyEnc: seal(input.rtmps.streamKey) } });
+        const freeStream = !(await prisma.passOffer.findUnique({ where: { matchId: m.id } }));
+        const ytKey = freeStream ? await prisma.youTubeKey.findFirst({ where: { ownerId: { in: [orgId ?? '', m.homeTeamId] } } }) : null;
+        if (ytKey) await addRestream(input.uid, 'rtmp://a.rtmp.youtube.com/live2', openSecret(ytKey.keyEnc)).catch((e) => req.log.warn(e, 'YouTube restream not added'));
+      } catch (e) {
+        await prisma.stream.delete({ where: { id: s.id } });
+        req.log.error(e);
+        throw new ApiError(502, 'The video service didn’t answer. Try going live again in a minute');
+      }
+    }
     // Older streams have no live input of their own: their id stands in, so the key never changes between calls.
-    const liveInputId = s.liveInputId ?? s.id;
+    const liveInputId = s2.liveInputId ?? s2.id;
     if (created) {
       m.streamId = s.id;
       await saveMatch(m);
@@ -215,8 +231,8 @@ export async function featureRoutes(app: FastifyInstance) {
     const paid = !!(await prisma.passOffer.findUnique({ where: { matchId: m.id } }));
     const yt = await prisma.youTubeKey.findFirst({ where: { ownerId: { in: [orgId ?? '', m.homeTeamId] } } });
     return {
-      stream: toStream(s),
-      ingest: { protocol: 'rtmps', url: 'rtmps://live.cloudflare.com:443/live/', streamKey: liveInputId },
+      stream: toStream(s2),
+      ingest: s2.ingestKeyEnc && s2.ingestUrl ? { protocol: 'rtmps', url: s2.ingestUrl, streamKey: openSecret(s2.ingestKeyEnc) } : { protocol: 'rtmps', url: 'rtmps://live.cloudflare.com:443/live/', streamKey: liveInputId },
       // The website serves the overlay: a transparent page for OBS or vMix, with the client's logo and sponsors.
       overlayUrl: `${process.env.WEB_URL ?? 'https://ovalcast.app'}/overlay/${m.id}`,
       youtube: paid ? 'blockedPaid' : yt ? 'restreaming' : 'notConnected',
@@ -238,6 +254,7 @@ export async function featureRoutes(app: FastifyInstance) {
     const orgId = await orgOfMatch(s.match.competitionId ?? undefined);
     if (s.startedBy !== user.id && !(await organisesMatch(user, await getMatch(s.matchId)))) throw forbidden('Only whoever started the stream, or the match’s organiser, can end it');
     await prisma.stream.update({ where: { id: s.id }, data: { status: 'ended' } });
+    if (s.liveInputId && videoConfigured()) await closeLiveInput(s.liveInputId);
     await refundIfMostlyDown(s.id);
     // Watchers and the match page hear it has ended.
     publish(s.matchId, { type: 'status', match: await getMatch(s.matchId) });

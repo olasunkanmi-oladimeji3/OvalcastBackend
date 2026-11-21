@@ -1,6 +1,7 @@
 // Accounts: sign up, sign in with email or phone, one-time codes, password
 // reset, sessions, and adding a second email or phone.
 
+import { isExpoToken } from '~/lib/push';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { countryOfPhone } from '@/engine';
@@ -264,6 +265,21 @@ export async function authRoutes(app: FastifyInstance) {
     });
     if (body.dateOfBirth) await copyBirthDateToPlayers(user.id);
     return loadUser(user.id);
+  });
+
+  // This phone can be sent notifications. Registering again moves the token to whoever is signed in now.
+  app.post('/me/push-tokens', async (req) => {
+    const user = requireUser(req);
+    const b = z.object({ token: z.string().trim().max(200).refine(isExpoToken, 'Not a push token'), platform: z.enum(['android', 'ios']) }).parse(req.body);
+    await prisma.pushToken.upsert({ where: { token: b.token }, create: { id: newId('push'), userId: user.id, token: b.token, platform: b.platform }, update: { userId: user.id, platform: b.platform, lastSeenAt: new Date() } });
+    return { ok: true as const };
+  });
+  // Signing out of this phone: stop sending to it.
+  app.delete('/me/push-tokens', async (req) => {
+    const user = requireUser(req);
+    const { token } = z.object({ token: z.string().trim().max(200) }).parse(req.body ?? {});
+    await prisma.pushToken.deleteMany({ where: { token, userId: user.id } });
+    return { ok: true as const };
   });
 
   app.post('/me/contacts', async (req) => {

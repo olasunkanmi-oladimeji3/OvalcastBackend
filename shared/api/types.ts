@@ -1364,6 +1364,17 @@ export interface PendingCertificate {
 }
 
 /** Shown once, when Ovalcast staff issue a key. */
+/** One webhook delivery, as the organisation's admins see it. */
+export interface WebhookDeliverySummary {
+  id: ID;
+  event: string;
+  status: 'pending' | 'delivered' | 'failed';
+  attempts: number;
+  createdAt: ISODate;
+  deliveredAt?: ISODate;
+  lastError?: string;
+}
+
 export interface IssuedApiKey {
   client: ApiClientSummary;
   key: string;
@@ -1575,6 +1586,9 @@ export interface OvalcastApi {
   // GET /notifications , POST /notifications/read
   listNotifications(): Promise<AppNotification[]>;
   markNotificationsRead(): Promise<void>;
+  /** POST/DELETE /me/push-tokens : this phone's Expo push token, for phone notifications. */
+  registerPushToken(token: string, platform: 'android' | 'ios'): Promise<{ ok: true }>;
+  unregisterPushToken(token: string): Promise<{ ok: true }>;
   // GET /search?q=
   search(q: string): Promise<SearchResults>;
 
@@ -1814,6 +1828,11 @@ export interface OvalcastApi {
   cancelOrganisationPlan(orgId: ID): Promise<OrganisationPlanStatus>;
   /** POST /organisations/:id/api-clients : a new key, shown once. Needs the Organisation plan. */
   createApiClient(orgId: ID, name: string): Promise<IssuedApiKey>;
+  /** Webhooks for a key, managed by the organisation's admins. The secret is returned once. */
+  addWebhook(orgId: ID, clientId: ID, url: string, events: string[]): Promise<{ id: ID; url: string; events: string[]; active: boolean; secret: string }>;
+  removeWebhook(orgId: ID, clientId: ID, webhookId: ID): Promise<{ ok: true }>;
+  testWebhook(orgId: ID, clientId: ID, webhookId: ID): Promise<{ ok: true }>;
+  listWebhookDeliveries(orgId: ID, clientId: ID, webhookId: ID): Promise<WebhookDeliverySummary[]>;
   staffSetPlan(orgId: ID, plan: 'free' | 'organisation'): Promise<Organisation>;
   staffListCertificates(): Promise<PendingCertificate[]>;
   staffReviewCertificate(certificateId: ID, decision: 'verified' | 'rejected'): Promise<PendingCertificate>;
