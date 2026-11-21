@@ -674,8 +674,10 @@ export interface Db {
   /** Paid streams, by match. */
   passOffers: Record<
     string,
-    { price: number; hostUserId: string; hostName: string }
+    { price: number; hostUserId: string; hostName: string; mode?: 'payPerView' | 'donation'; suggested?: number[] }
   >;
+  /** Gifts to donation streams (the demo keeps the thank-you list here). */
+  donations?: { matchId: string; name: string; amount: number; message?: string; at: string }[];
   passes: MatchPass[];
   /** Pass income per hosted match, for host earnings. */
   passSales: {

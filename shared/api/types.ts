@@ -7,7 +7,8 @@ import type { BallEvent, PlayingConditions } from '@/engine';
 export type ID = string;
 export type ISODate = string;
 
-export type Role = 'owner' | 'leagueAdmin' | 'scorer' | 'clubAdmin' | 'player';
+/** media: a club's or league's standing streamer, who may stream any of its matches (no cut of the money). */
+export type Role = 'owner' | 'leagueAdmin' | 'scorer' | 'clubAdmin' | 'player' | 'media' | 'transferOfficer';
 
 export interface User {
   id: ID;
@@ -255,6 +256,51 @@ export interface PlayerRules {
   squadApproval?: boolean;
   /** null: no transfers once the league starts. */
   transfers: { windows: { name: string; opensOn: ISODate; closesOn: ISODate }[]; maxPerPlayer: number } | null;
+  /**
+   * The league's player marketplace: clubs in the league see players open to offers and players
+   * their clubs list, and make offers through the usual transfer steps. `showQyp`: also players who
+   * may add a second club here (within the QYP age, with one club), tagged QYP.
+   */
+  market?: { enabled: boolean; showQyp: boolean };
+}
+
+/** A player on a league's marketplace: open to offers (they said so), listed by their club, or QYP. */
+export interface MarketPlayer {
+  playerId: ID;
+  name: string;
+  role?: string;
+  teamId: ID;
+  teamName: string;
+  /** The player said they're open to offers. */
+  open?: MarketListing;
+  /** Their club listed them. */
+  listed?: MarketListing;
+  /** May add a second club in this league (within the QYP age, one club so far). */
+  qyp: boolean;
+}
+
+export interface MarketListing {
+  id: ID;
+  /** open: the player; listed: their club. */
+  kind: 'open' | 'listed';
+  /** What's on offer: a move, a second club (QYP), or either. */
+  wants: 'move' | 'dual' | 'either';
+  note?: string;
+  at: ISODate;
+}
+
+export interface LeagueMarket {
+  competitionId: ID;
+  enabled: boolean;
+  showQyp: boolean;
+  /** Whether offers can be made now (an open window, or before the league starts). */
+  windowOpen: boolean;
+  windowNote?: string;
+  /** The clubs in this league the viewer runs: they make offers. */
+  myTeamIds: ID[];
+  /** The viewer's own player records in this league, which they can mark open to offers. */
+  myPlayerIds: ID[];
+  players: MarketPlayer[];
 }
 
 /** A player in a club's squad for one league. */
@@ -396,7 +442,7 @@ export interface Match {
   toss?: { wonByTeamId: ID; decision: 'bat' | 'bowl'; method: 'online' | 'manual'; at: ISODate };
   battingFirstTeamId?: ID;
   playingXI?: Record<ID, ID[]>;
-  officials: { /** Names on the scorecard: those with accounts first, in the order of `umpireUserIds`, then names only. */ umpires: string[]; umpireUserIds?: ID[]; scorerUserId?: ID; scorerName?: string; /** Who prepared the ground: names, and accounts where they have one. */ groundsmen?: string[]; groundsmanUserIds?: ID[] };
+  officials: { /** Names on the scorecard: those with accounts first, in the order of `umpireUserIds`, then names only. */ umpires: string[]; umpireUserIds?: ID[]; scorerUserId?: ID; scorerName?: string; /** Who prepared the ground: names, and accounts where they have one. */ groundsmen?: string[]; groundsmanUserIds?: ID[]; /** Approved to stream, with their agreed part of the host share. */ streamers?: MatchStreamer[] };
   /** Who created a friendly; they and the clubs' admins can invite officials. */
   createdBy?: ID;
   /** Server-calculated summary, kept for lists and tables. */
@@ -665,7 +711,11 @@ export interface OfficialInvite {
   matchId: ID;
   userId: ID;
   userName: string;
-  role: 'scorer' | 'umpire' | 'groundsman';
+  role: 'scorer' | 'umpire' | 'groundsman' | 'streamer';
+  /** invite: the organiser asked them. request: they asked to stream and the organiser answers. */
+  kind?: 'invite' | 'request';
+  /** Streamers: the agreed part of the host share (0.4 = 40%). */
+  streamerShare?: number;
   invitedBy: ID;
   invitedByName: string;
   status: 'pending' | 'accepted' | 'declined' | 'withdrawn';
@@ -901,12 +951,25 @@ export interface Stream {
 /** A paid stream: fans buy a pass for the match (there are no season passes for streams). */
 export interface PassOffer {
   matchId: ID;
+  /** payPerView: buy a pass at `price` to watch. donation: free to watch; give what you like (at least `minimum`). */
+  mode: 'payPerView' | 'donation';
   price: number;
   currency: Currency;
   hostUserId: ID;
   hostName: string;
+  /** Donation streams: suggested amounts, the smallest gift, and recent supporters. */
+  suggested?: number[];
+  minimum?: number;
+  supporters?: { name: string; amount: number; message?: string; at: ISODate }[];
   /** The signed-in viewer's pass, if they have one. */
   mine?: MatchPass;
+}
+
+/** A match's approved streamer and their agreed part of the host share (0.4 = 40%). */
+export interface MatchStreamer {
+  userId: ID;
+  name: string;
+  share: number;
 }
 
 export interface MatchPass {
@@ -976,7 +1039,8 @@ export interface HostEarnings {
   balance: number;
   minimumPayout: number;
   nextPayoutOn: ISODate;
-  matches: { matchId: ID; passes: number; gross: number; fees: number; host: number; at: ISODate }[];
+  /** Per match: passes sold and donations received, and your part (as host, or as an approved streamer). */
+  matches: { matchId: ID; passes: number; donations?: number; gross: number; fees: number; host: number; at: ISODate }[];
   payouts: { id: ID; amount: number; status: 'processing' | 'paid'; reference: string; at: ISODate }[];
 }
 
@@ -1071,7 +1135,7 @@ export interface ApiClientSummary {
 export interface AdminMember {
   userId: ID;
   name: string;
-  role: 'owner' | 'leagueAdmin' | 'clubAdmin';
+  role: 'owner' | 'leagueAdmin' | 'clubAdmin' | 'media' | 'transferOfficer';
   contact?: string;
 }
 
@@ -1543,7 +1607,36 @@ export interface OvalcastApi {
   // Paid streams. GET /matches/:id/pass-offer (null when free) , PUT /matches/:id/pass-offer (host) , POST /matches/:id/passes
   getPassOffer(matchId: ID): Promise<PassOffer | null>;
   setPassPrice(matchId: ID, price: number | null): Promise<PassOffer | null>;
+  // PUT /matches/:id/pass-offer: pay per view at a price, or a free donation stream with suggested amounts (null: free, no offer)
+  setStreamOffer(matchId: ID, offer: { mode: 'payPerView'; price: number } | { mode: 'donation'; suggested: number[] } | null): Promise<PassOffer | null>;
   buyPass(matchId: ID, input: { paidWith: Payment['method'] | 'wallet' }): Promise<CheckoutResult>;
+  // POST /matches/:id/donations: a gift to a donation stream. Guests (signed out) give an email for the receipt; no wallet.
+  donate(matchId: ID, input: { amount: number; paidWith: Payment['method'] | 'wallet'; name?: string; anonymous?: boolean; message?: string; email?: string }): Promise<CheckoutResult>;
+
+  // Streamers. POST /matches/:id/streamers (organiser invites, with their agreed share) , POST /matches/:id/streamers/requests (ask to stream) ,
+  // DELETE /matches/:id/streamers/:userId (organiser). Invites and requests are answered with respondToOfficialInvite.
+  // who: the email or phone number on their Ovalcast account
+  inviteStreamer(matchId: ID, who: string, share: number, note?: string): Promise<OfficialInvite>;
+  askToStream(matchId: ID, share: number, note?: string): Promise<OfficialInvite>;
+  removeStreamer(matchId: ID, userId: ID): Promise<Match>;
+  // A club's or league's Media list: standing streamers for any of its matches (no cut). GET/POST/DELETE /organisations/:id/media , /teams/:id/media
+  listOrgMedia(orgId: ID): Promise<AdminMember[]>;
+  addOrgMedia(orgId: ID, identifier: string): Promise<AdminMember[]>;
+  removeOrgMedia(orgId: ID, userId: ID): Promise<AdminMember[]>;
+  listClubMedia(teamId: ID): Promise<AdminMember[]>;
+  addClubMedia(teamId: ID, identifier: string): Promise<AdminMember[]>;
+  removeClubMedia(teamId: ID, userId: ID): Promise<AdminMember[]>;
+  // Deputy approvers: approve transfers, squads and held players while the league's admins are away. /organisations/:id/deputies
+  listDeputies(orgId: ID): Promise<AdminMember[]>;
+  addDeputy(orgId: ID, identifier: string): Promise<AdminMember[]>;
+  removeDeputy(orgId: ID, userId: ID): Promise<AdminMember[]>;
+  /** A league admin changes the league's player rules (second clubs, QYP age, windows, marketplace). */
+  setPlayerRules(competitionId: ID, rules: PlayerRules): Promise<Competition>;
+  /** The league's marketplace: players open to offers, listed by their clubs, and QYP players. */
+  getMarket(competitionId: ID): Promise<LeagueMarket>;
+  /** The player marks themselves open to offers, or their club lists them. Again to update. */
+  listOnMarket(competitionId: ID, input: { playerId: ID; kind?: MarketListing['kind']; wants: MarketListing['wants']; note?: string }): Promise<MarketListing>;
+  removeFromMarket(listingId: ID): Promise<{ ok: true }>;
   // GET /payments/:reference: one of your own payments, after Flutterwave sends you back.
   getPayment(reference: string): Promise<PaymentStatus>;
 

@@ -4,7 +4,7 @@
 // is anything given: Pro, a wallet top-up, a pass, viewer credits or a paid entry.
 
 import type { Payment, User } from '@/api/types';
-import { currencyForCountry, formatMoney, refundDue, type PaidFeature, renewsOn, splitPass, VIEWER_CREDIT_PACK, type BillingInterval, type FinanceCurrency, type PlanId } from '@/engine';
+import { currencyForCountry, formatMoney, refundDue, type PaidFeature, renewsOn, splitPass, splitWithStreamer, VIEWER_CREDIT_PACK, type BillingInterval, type FinanceCurrency, type PlanId } from '@/engine';
 import { json, prisma, toJson } from '~/db/client';
 import { requestOrigin } from '~/lib/requestContext';
 import { ApiError } from '~/lib/errors';
@@ -12,11 +12,13 @@ import { newId } from '~/lib/ids';
 import { payInstantly, payments } from '~/lib/payments';
 import { notify } from '~/lib/repo';
 import { allows, limitsOf, planNeededFor } from './access';
-import { on } from '~/lib/bus';
+import { emit, on } from '~/lib/bus';
+import { orgOfMatch, rebuildSales, streamerCut } from '~/lib/streaming';
+import { getMatch } from '~/services/matches';
 import { TtlCache, registerCache } from '~/lib/cache';
 import { platformShareFor } from '~/lib/shares';
 
-export type CheckoutKind = 'entry' | 'pro' | 'topUp' | 'pass' | 'credits';
+export type CheckoutKind = 'entry' | 'pro' | 'topUp' | 'pass' | 'credits' | 'donation';
 
 // ------------------------------------------------------------------ plans
 
@@ -136,6 +138,10 @@ export async function completeCheckout(id: string, charge: { providerId: string;
     else await issuePass({ userId: c.userId, matchId: c.refId!, price: c.amount, currency: c.currency, paidWith: methodName(charge.paymentType), international: charge.international });
   }
 
+  if (c.kind === 'donation') {
+    await recordDonation({ matchId: c.refId!, userId: c.userId === 'guest' ? undefined : c.userId, email: typeof meta.email === 'string' ? meta.email : undefined, donorName: String(meta.name ?? 'A supporter'), anonymous: !!meta.anonymous, message: typeof meta.message === 'string' ? meta.message : undefined, amount: c.amount, currency: c.currency, paidWith: methodName(charge.paymentType), international: charge.international });
+  }
+
   if (c.kind === 'credits') {
     const hours = Number(meta.packs) * VIEWER_CREDIT_PACK.viewerHours;
     await prisma.$transaction([
@@ -176,17 +182,34 @@ const methodName = (paymentType: string): Payment['method'] =>
  */
 export async function issuePass(p: { userId: string; matchId: string; price: number; currency: string; paidWith: Payment['method'] | 'wallet'; international?: boolean }) {
   const offer = await prisma.passOffer.findUniqueOrThrow({ where: { matchId: p.matchId } });
-  const m = await prisma.match.findUniqueOrThrow({ where: { id: p.matchId }, select: { competition: { select: { orgId: true } } } });
-  const platformShare = await platformShareFor(offer.hostUserId, m.competition?.orgId);
+  const m = await getMatch(p.matchId);
+  const platformShare = await platformShareFor(offer.hostUserId, await orgOfMatch(m));
   const split = splitPass(p.price, p.currency as FinanceCurrency, platformShare, p.paidWith, p.international);
-  await prisma.$transaction([
-    prisma.matchPass.create({ data: { id: newId('pass'), userId: p.userId, matchId: p.matchId, competitionId: null, price: p.price, currency: p.currency, paidWith: p.paidWith, status: 'active', hostUserId: offer.hostUserId, fee: split.providerFee, hostShare: split.host, platformShare } }),
-    prisma.passSale.upsert({
-      where: { matchId_hostUserId: { matchId: p.matchId, hostUserId: offer.hostUserId } },
-      create: { matchId: p.matchId, hostUserId: offer.hostUserId, passes: 1, gross: p.price, fees: split.providerFee, host: split.host, currency: p.currency },
-      update: { passes: { increment: 1 }, gross: { increment: p.price }, fees: { increment: split.providerFee }, host: { increment: split.host } },
-    }),
-  ]);
+  // An approved streamer's agreed part of the host share, for a sale made while they stream.
+  const cut = await streamerCut(m, offer.hostUserId);
+  const part = cut ? splitWithStreamer(split.host, cut.share).streamer : 0;
+  await prisma.matchPass.create({ data: { id: newId('pass'), userId: p.userId, matchId: p.matchId, competitionId: null, price: p.price, currency: p.currency, paidWith: p.paidWith, status: 'active', hostUserId: offer.hostUserId, fee: split.providerFee, hostShare: split.host, platformShare, streamerUserId: part ? cut!.userId : null, streamerAmount: part } });
+  await rebuildSales(p.matchId);
+}
+
+/**
+ * A gift to a donation stream, split like a pass: the payment fee (none from the wallet), the
+ * platform share at today's rate, then the host share, part of which goes to an approved streamer.
+ * The host and streamer are told; the gift shows on the stream's thank-you list unless anonymous.
+ */
+export async function recordDonation(d: { matchId: string; userId?: string; email?: string; donorName: string; anonymous: boolean; message?: string; amount: number; currency: string; paidWith: Payment['method'] | 'wallet'; international?: boolean }) {
+  const offer = await prisma.passOffer.findUniqueOrThrow({ where: { matchId: d.matchId } });
+  const m = await getMatch(d.matchId);
+  const platformShare = await platformShareFor(offer.hostUserId, await orgOfMatch(m));
+  const split = splitPass(d.amount, d.currency as FinanceCurrency, platformShare, d.paidWith, d.international);
+  const cut = await streamerCut(m, offer.hostUserId);
+  const part = cut ? splitWithStreamer(split.host, cut.share).streamer : 0;
+  await prisma.donation.create({ data: { id: newId('don'), matchId: d.matchId, userId: d.userId ?? null, email: d.email ?? null, donorName: d.donorName.slice(0, 60), anonymous: d.anonymous, message: d.message?.slice(0, 140) ?? null, amount: d.amount, currency: d.currency, paidWith: d.paidWith, fee: split.providerFee, platformShare, hostShare: split.host, hostUserId: offer.hostUserId, streamerUserId: part ? cut!.userId : null, streamerAmount: part } });
+  await rebuildSales(d.matchId);
+  const who = d.anonymous ? 'Someone' : d.donorName;
+  const money = formatMoney(d.amount, d.currency as FinanceCurrency);
+  await notify([offer.hostUserId, ...(part ? [cut!.userId] : [])], { kind: 'payment', title: `${who} gave ${money} to your stream`, body: d.message ? `“${d.message.slice(0, 140)}”` : 'Thank them on the stream.', link: { pathname: '/match/[id]', params: { id: d.matchId } } });
+  emit('responses:clear', null);
 }
 
 /** The viewer's active pass for this match. Passes are per match: there are no season passes for streams. */
@@ -207,7 +230,8 @@ export function mayWatch(userId: string | undefined, matchId: string) {
 
 async function mayWatchNow(userId: string | undefined, matchId: string) {
   const offer = await prisma.passOffer.findUnique({ where: { matchId } });
-  if (!offer) return true;
+  // Free streams, and donation streams (free to watch; giving is optional).
+  if (!offer || offer.mode === 'donation') return true;
   if (userId === offer.hostUserId) return true;
   return !!(await passFor(userId, matchId));
 }
@@ -266,7 +290,8 @@ export async function refundMatchPasses(matchId: string, reason: string) {
     await giveBack(checkout?.id, p.userId, p.price, p.currency, reason, { paidFromWallet: p.paidWith === 'wallet' });
     amount += p.price;
   }
-  await prisma.passSale.updateMany({ where: { matchId }, data: { passes: 0, gross: 0, fees: 0, host: 0 } });
+  // Rebuilt from what's left: refunded passes drop out, donations stay.
+  await rebuildSales(matchId);
   return { refunded: passes.length, amount };
 }
 

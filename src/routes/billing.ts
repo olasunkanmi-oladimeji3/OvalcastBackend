@@ -2,10 +2,10 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import type { HostEarnings, MatchPass, PassOffer, PlanStatus, Subscription, ViewerCredits, Wallet } from '@/api/types';
-import { VIEWER_CREDIT_PACK, currencyForCountry, formatMoney, hostPayoutMinimum, viewerCreditPackPrice, walletTopUps, type FinanceCurrency, minimumPassPrice, nextHostPayout, proPrice, type BillingInterval, type PlayingConditions } from '@/engine';
+import type { HostEarnings, MatchPass, PassOffer, PlanStatus, Subscription, User, ViewerCredits, Wallet } from '@/api/types';
+import { VIEWER_CREDIT_PACK, currencyForCountry, donationSuggestions, minimumDonation, formatMoney, hostPayoutMinimum, viewerCreditPackPrice, walletTopUps, type FinanceCurrency, minimumPassPrice, nextHostPayout, proPrice, type BillingInterval, type PlayingConditions } from '@/engine';
 import type * as P from '~/generated/prisma/client';
-import { json, prisma } from '~/db/client';
+import { json, prisma, Prisma } from '~/db/client';
 import { requireUser } from '~/lib/auth';
 import { badRequest, conflict, forbidden, notFound } from '~/lib/errors';
 import { oneAtATime } from '~/lib/lock';
@@ -13,8 +13,10 @@ import { platformShareFor } from '~/lib/shares';
 import { newId } from '~/lib/ids';
 import { isLeagueAdmin } from '~/lib/repo';
 import { limitsOf } from '~/services/access';
-import { canHost, issuePass, leaguePlan, matchesThisMonth, passFor, startCheckout, userPlan, walletCurrency } from '~/services/billing';
-import { on } from '~/lib/bus';
+import { canHost, issuePass, leaguePlan, matchesThisMonth, passFor, recordDonation, startCheckout, userPlan, walletCurrency } from '~/services/billing';
+import { organisesMatch } from '~/lib/streaming';
+import { getMatch } from '~/services/matches';
+import { emit, on } from '~/lib/bus';
 import { TtlCache, registerCache } from '~/lib/cache';
 
 const METHOD = z.enum(['card', 'bankTransfer', 'ussd', 'mobileMoney']);
@@ -40,7 +42,17 @@ async function offerNow(matchId: string, userId?: string): Promise<PassOffer | n
   const o = await prisma.passOffer.findUnique({ where: { matchId } });
   if (!o) return null;
   const mine = await passFor(userId, matchId);
-  return { matchId, price: o.price, currency: o.currency as PassOffer['currency'], hostUserId: o.hostUserId, hostName: o.hostName, mine: mine ? toPass(mine) : undefined };
+  const currency = o.currency as PassOffer['currency'];
+  if (o.mode === 'donation') {
+    // The thank-you list: the latest gifts, named unless the giver asked to stay anonymous.
+    const gifts = await prisma.donation.findMany({ where: { matchId }, orderBy: { at: 'desc' }, take: 12 });
+    return {
+      matchId, mode: 'donation', price: 0, currency, hostUserId: o.hostUserId, hostName: o.hostName,
+      suggested: json<number[] | null>(o.suggested) ?? donationSuggestions(currency), minimum: minimumDonation(currency),
+      supporters: gifts.map((g) => ({ name: g.anonymous ? 'Anonymous' : g.donorName, amount: g.amount, message: g.message ?? undefined, at: g.at.toISOString() })),
+    };
+  }
+  return { matchId, mode: 'payPerView', price: o.price, currency, hostUserId: o.hostUserId, hostName: o.hostName, mine: mine ? toPass(mine) : undefined };
 }
 
 export async function billingRoutes(app: FastifyInstance) {
@@ -109,23 +121,42 @@ export async function billingRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------- paid streams
   app.get<{ Params: { id: string } }>('/matches/:id/pass-offer', async (req) => offerFor(req.params.id, req.user?.id));
 
+  // The organiser sets how the stream earns: pay per view at a price, or donations (free to watch).
+  // `{ price }` alone is pay per view, as before; null removes the offer (free, nothing to give).
   app.put<{ Params: { id: string } }>('/matches/:id/pass-offer', async (req) => {
     const user = requireUser(req);
-    const { price } = z.object({ price: z.number().int().positive().nullable() }).parse(req.body);
+    const b = z.object({ price: z.number().int().positive().nullable().optional(), mode: z.enum(['payPerView', 'donation']).optional(), suggested: z.array(z.number().int().positive()).min(1).max(3).optional() }).parse(req.body);
     const m = await prisma.match.findUnique({ where: { id: req.params.id }, include: { competition: { include: { org: true } } } });
     if (!m) throw notFound('Match');
+    if (!(await organisesMatch(user, await getMatch(m.id)))) throw forbidden('Only the match’s organiser sets how its stream earns: a league admin, or for a friendly its creator or a club admin');
     if (!(await canHost(user, m))) throw forbidden('Selling match passes needs Pro, or a league on the Organisation plan');
-    if (price === null) {
+    const mode = b.mode ?? 'payPerView';
+    if (b.price === null) {
       await prisma.passOffer.deleteMany({ where: { matchId: m.id } });
+      emit('responses:clear', null);
       return null;
     }
+    if (mode === 'donation') {
+      const currency = (m.competition?.org.currency as FinanceCurrency | undefined) ?? currencyForCountry(user.country);
+      const min = minimumDonation(currency);
+      const suggested = [...new Set(b.suggested ?? donationSuggestions(currency))].sort((x, y) => x - y);
+      if (suggested.some((v) => v < min)) throw badRequest(`Suggested amounts start at ${formatMoney(min, currency)}`);
+      // Passes already bought for this match stay valid; new viewers watch free.
+      const data = { price: 0, currency, hostUserId: user.id, hostName: user.name, season: false, mode: 'donation', suggested: suggested };
+      await prisma.passOffer.upsert({ where: { matchId: m.id }, create: { matchId: m.id, ...data }, update: data });
+      emit('responses:clear', null);
+      return offerFor(m.id, user.id);
+    }
+    const price = b.price;
+    if (!price) throw badRequest('Set a price for each pass');
     const overs = (json<PlayingConditions | null>(m.conditions) ?? json<PlayingConditions | null>(m.competition?.conditions))?.oversPerInnings ?? 20;
     // League matches are priced in the organisation's currency; friendlies in the host's.
     const currency = (m.competition?.org.currency as FinanceCurrency | undefined) ?? currencyForCountry(user.country);
     const min = minimumPassPrice(overs, currency);
     if (price < min) throw badRequest(`The lowest price for a ${overs}-over match is ${formatMoney(min, currency)}`);
-    const data = { price, currency, hostUserId: user.id, hostName: user.name, season: false };
+    const data = { price, currency, hostUserId: user.id, hostName: user.name, season: false, mode: 'payPerView', suggested: Prisma.DbNull };
     await prisma.passOffer.upsert({ where: { matchId: m.id }, create: { matchId: m.id, ...data }, update: data });
+    emit('responses:clear', null);
     return offerFor(m.id, user.id);
   });
 
@@ -137,6 +168,7 @@ export async function billingRoutes(app: FastifyInstance) {
     return oneAtATime(`pass:${user.id}:${matchId}`, async () => {
       const o = await prisma.passOffer.findUnique({ where: { matchId } });
       if (!o) throw notFound('Paid stream');
+      if (o.mode === 'donation') throw conflict('This stream is free to watch. You can give what you like instead.');
       if (o.hostUserId === user.id) throw conflict('You host this stream');
       // Read from the database, not the cache: the pass may have been bought a moment ago.
       const had = await passFor(user.id, matchId);
@@ -164,6 +196,43 @@ export async function billingRoutes(app: FastifyInstance) {
     });
   });
 
+  // -------------------------------------------------------- donations
+  // A gift to a donation stream. Signed in: from the wallet or by payment. Signed out: by payment,
+  // with an email for the receipt. Shown on the thank-you list unless anonymous.
+  app.post<{ Params: { id: string } }>('/matches/:id/donations', async (req) => {
+    const b = z.object({ amount: z.number().int().positive(), paidWith: z.union([z.literal('wallet'), METHOD]), name: z.string().trim().max(60).optional(), anonymous: z.boolean().optional(), message: z.string().trim().max(140).optional(), email: z.string().trim().max(120).optional() }).parse(req.body);
+    const o = await prisma.passOffer.findUnique({ where: { matchId: req.params.id } });
+    if (!o || o.mode !== 'donation') throw notFound('Donation stream');
+    const currency = o.currency as FinanceCurrency;
+    const min = minimumDonation(currency);
+    if (b.amount < min) throw badRequest(`The smallest gift is ${formatMoney(min, currency)}`);
+    const user = req.user;
+    const name = b.name || user?.name || 'A supporter';
+    const meta = { name, anonymous: !!b.anonymous, message: b.message, email: user ? undefined : b.email };
+    if (!user) {
+      if (!b.email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(b.email)) throw badRequest('Add your email for the receipt');
+      if (b.paidWith === 'wallet') throw badRequest('Sign in to give from your wallet');
+      // A guest checkout: no account, just the email for the receipt.
+      return startCheckout({ kind: 'donation', user: { id: 'guest', name, email: b.email.toLowerCase() } as User, refId: o.matchId, amount: b.amount, currency, method: b.paidWith, title: 'Stream donation', meta });
+    }
+    if (b.paidWith === 'wallet') {
+      const wc = await walletCurrency(user.id);
+      if (wc !== currency) throw conflict(`This stream takes ${currency} and your wallet is in ${wc}. Pay by card instead; your bank converts it.`);
+      const taken = await prisma.wallet.updateMany({ where: { userId: user.id, balance: { gte: b.amount } }, data: { balance: { decrement: b.amount } } });
+      if (!taken.count) throw conflict('Not enough in your wallet. Top it up, or pay by card or transfer.');
+      const reference = `GIFT-${newId('x').slice(-6).toUpperCase()}`;
+      try {
+        await prisma.walletEntry.create({ data: { id: newId('w'), userId: user.id, kind: 'donation', amount: -b.amount, note: 'Stream donation', reference } });
+        await recordDonation({ matchId: o.matchId, userId: user.id, donorName: name, anonymous: !!b.anonymous, message: b.message, amount: b.amount, currency, paidWith: 'wallet' });
+      } catch (e) {
+        await prisma.wallet.update({ where: { userId: user.id }, data: { balance: { increment: b.amount } } });
+        throw e;
+      }
+      return { status: 'paid' as const, reference };
+    }
+    return startCheckout({ kind: 'donation', user, refId: o.matchId, amount: b.amount, currency, method: b.paidWith, title: 'Stream donation', meta });
+  });
+
   // -------------------------------------------------------- host earnings
   app.get('/me/earnings', async (req): Promise<HostEarnings> => {
     const user = requireUser(req);
@@ -175,7 +244,7 @@ export async function billingRoutes(app: FastifyInstance) {
     return {
       // What the host keeps of each pass after the payment fee, at today's rate.
       currency, share: Math.round((1 - (await platformShareFor(user.id))) * 1000) / 1000, balance: earned - paid, minimumPayout: hostPayoutMinimum(currency), nextPayoutOn: nextHostPayout(new Date()).toISOString(),
-      matches: sales.map((x) => ({ matchId: x.matchId, passes: x.passes, gross: x.gross, fees: x.fees, host: x.host, at: x.at.toISOString() })),
+      matches: sales.map((x) => ({ matchId: x.matchId, passes: x.passes, donations: x.donations, gross: x.gross, fees: x.fees, host: x.host, at: x.at.toISOString() })),
       payouts: payouts.map((x) => ({ id: x.id, amount: x.amount, status: x.status as 'processing' | 'paid', reference: x.reference, at: x.at.toISOString() })),
     };
   });

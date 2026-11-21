@@ -104,3 +104,23 @@ export const viewerCreditPackPrice = (currency: FinanceCurrency = 'NGN') => loca
 /** Wallet top-ups, so fans avoid a payment fee on every pass: ₦1,000 to ₦10,000, or the same values locally. */
 export const WALLET_TOP_UPS = [1000, 2500, 5000, 10000] as const;
 export const walletTopUps = (currency: FinanceCurrency = 'NGN') => [...new Set(WALLET_TOP_UPS.map((n) => localPrice(n, currency)))];
+
+/** The smallest donation to a stream (₦200 or the same value), so payment fees don't swallow it. */
+export function minimumDonation(currency: FinanceCurrency = 'NGN'): number {
+  return localPrice(200, currency);
+}
+
+/** Suggested donation amounts a host starts from (₦500, ₦1,000 and ₦2,000, or the same value). */
+export function donationSuggestions(currency: FinanceCurrency = 'NGN'): number[] {
+  return [500, 1000, 2000].map((n) => localPrice(n, currency)).filter((v, i, a) => a.indexOf(v) === i);
+}
+
+/**
+ * An approved streamer's part of a sale's host share (`share` 0.4 = 40%), and what stays with the
+ * host. Whole units; any rounding stays with the host.
+ */
+export function splitWithStreamer(hostShare: number, share: number): { streamer: number; host: number } {
+  const s = Math.max(0, Math.min(1, share || 0));
+  const streamer = Math.floor(hostShare * s);
+  return { streamer, host: hostShare - streamer };
+}

@@ -214,6 +214,11 @@ export const toRegistration = (r: P.Registration) => ({ ...r, since: r.since.toI
 
 export const isLeagueAdmin = (u: User | undefined, orgId?: string) =>
   !!u && !!orgId && u.memberships.some((m) => m.orgId === orgId && (m.role === 'leagueAdmin' || m.role === 'owner'));
+/**
+ * A league admin, or one of the deputies the league named to approve transfers, squads and held
+ * players while its organisers are away.
+ */
+export const mayApprovePlayers = (u: User | undefined, orgId?: string) => isLeagueAdmin(u, orgId) || (!!u && !!orgId && u.memberships.some((m) => m.orgId === orgId && m.role === 'transferOfficer'));
 export const isClubAdmin = (u: User | undefined, teamId?: string) => !!u && !!teamId && u.memberships.some((m) => m.clubId === teamId && m.role === 'clubAdmin');
 
 // ---------------------------------------------------------- notifications
@@ -223,6 +228,12 @@ export async function notify(userIds: string | string[], n: Omit<AppNotification
   if (!ids.length) return;
   // Production also fans out to push, SMS and WhatsApp according to each user's settings.
   await prisma.notification.createMany({ data: ids.map((userId) => ({ id: newId('n'), userId, kind: n.kind, title: n.title, body: n.body, link: toJson(n.link) })) });
+}
+
+/** Everyone who approves a league's players: its admins and its deputy approvers. */
+export async function playerApproverIds(orgId: string) {
+  const rows = await prisma.membership.findMany({ where: { orgId, role: { in: ['leagueAdmin', 'owner', 'transferOfficer'] } }, select: { userId: true } });
+  return [...new Set(rows.map((r) => r.userId))];
 }
 
 export async function clubAdminIds(teamId: string) {

@@ -177,3 +177,29 @@ export function registrationCheck(args: {
   if (clash) return { ok: false, reason: clash.reason, canChoose: false };
   return { ok: true, primary: clubs.length === 0 };
 }
+
+/**
+ * Whether clubs can make offers in this league now: before it starts, or while a window is open.
+ * `note` says when the next window opens, or that transfers are off.
+ */
+export function transferWindowNow(league: LeagueRef, now = new Date()): { open: boolean; note?: string } {
+  const rules = league.playerRules;
+  if (!rules.transfers) return { open: false, note: `${league.name} does not allow transfers once the league starts` };
+  if (league.status === 'entries') return { open: true, note: 'Before the league starts' };
+  const w = openWindow(rules, now);
+  if (w) return { open: true, note: `${w.name} closes ${day(w.closesOn)}` };
+  const next = nextWindow(rules, now);
+  return { open: false, note: next ? `The transfer window is closed. ${next.name} opens ${day(next.opensOn)}` : 'The transfer window is closed for this season' };
+}
+
+/**
+ * A qualified young player (QYP) in this league: second clubs are allowed with an age limit, the
+ * player is within it on the day the league starts, and has room for another club here.
+ * Without a date of birth on record nobody is QYP.
+ */
+export function isQyp(rules: LeagueRules, clubsHere: number, birthDate: string | undefined, leagueStartsOn: string): boolean {
+  const m = rules.multiClub;
+  if (!m.allowed || m.maxAge === undefined || !birthDate) return false;
+  if (clubsHere < 1 || clubsHere >= m.maxClubs) return false;
+  return ageOn(birthDate, leagueStartsOn) <= m.maxAge;
+}

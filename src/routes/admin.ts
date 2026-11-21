@@ -13,7 +13,7 @@ import { badRequest, conflict, forbidden, notFound } from '~/lib/errors';
 import { newId } from '~/lib/ids';
 import { logStaff } from '~/lib/staffLog';
 import { embedSettingsOf } from './embeds';
-import { isClubAdmin, isLeagueAdmin, loadUser, notify, toCompetition, toOrg, toPlayer, toRegistration, toTeam } from '~/lib/repo';
+import { isClubAdmin, isLeagueAdmin, loadUser, mayApprovePlayers, notify, toCompetition, toOrg, toPlayer, toRegistration, toTeam } from '~/lib/repo';
 import { registerPlayers, tellAboutHolds } from '~/lib/registration';
 import { maskContact, toInvite as toInviteView } from '~/lib/invites';
 import { storage } from '~/lib/storage';
@@ -40,6 +40,11 @@ async function orgAdmins(orgId: string): Promise<AdminMember[]> {
 async function clubAdmins(teamId: string): Promise<AdminMember[]> {
   const rows = await prisma.membership.findMany({ where: { clubId: teamId, role: 'clubAdmin' }, include: { user: true } });
   return rows.map((r) => ({ userId: r.userId, name: r.user.name, role: 'clubAdmin', contact: contactOf(r.user) }));
+}
+/** A club's or league's Media list: standing streamers for any of its matches. */
+async function mediaOf(where: { orgId: string } | { clubId: string }, role: 'media' | 'transferOfficer' = 'media'): Promise<AdminMember[]> {
+  const rows = await prisma.membership.findMany({ where: { ...where, role }, include: { user: true } });
+  return rows.map((r) => ({ userId: r.userId, name: r.user.name, role, contact: contactOf(r.user) }));
 }
 async function orgWithLinks(o: P.Organisation): Promise<Organisation> {
   const [comps, clubs] = await Promise.all([prisma.competition.findMany({ where: { orgId: o.id }, select: { id: true } }), prisma.team.findMany({ where: { orgId: o.id }, select: { id: true } })]);
@@ -112,6 +117,78 @@ export async function adminRoutes(app: FastifyInstance) {
     if ((await clubAdmins(req.params.id)).length <= 1) throw conflict('A club needs at least one admin. Add the new admin first.');
     await prisma.membership.deleteMany({ where: { userId: req.params.userId, clubId: req.params.id, role: 'clubAdmin' } });
     return clubAdmins(req.params.id);
+  });
+
+  // ------------------------------------------------------------- media lists
+  // Standing streamers: they may stream any of the club's or league's matches, for it (no cut).
+  const findAccount = async (identifier: string, country?: string) => {
+    const other = await prisma.user.findUnique({ where: identifier.includes('@') ? { email: normaliseIdentifier(identifier, country) } : { phone: normaliseIdentifier(identifier, country) } });
+    if (!other) throw notFound('Ovalcast account with that phone or email. Ask them to sign up first');
+    return other;
+  };
+  app.get<{ Params: { id: string } }>('/organisations/:id/media', async (req) => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can see its Media list');
+    return mediaOf({ orgId: req.params.id });
+  });
+  app.post<{ Params: { id: string } }>('/organisations/:id/media', async (req) => {
+    const user = requireUser(req);
+    const { identifier } = z.object({ identifier: z.string().trim().min(5) }).parse(req.body);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can add to its Media list');
+    const other = await findAccount(identifier, user.country);
+    if (!(await prisma.membership.count({ where: { userId: other.id, orgId: req.params.id, role: 'media' } }))) await prisma.membership.create({ data: { id: newId('mem'), userId: other.id, orgId: req.params.id, role: 'media' } });
+    const org = await prisma.organisation.findUniqueOrThrow({ where: { id: req.params.id } });
+    await notify(other.id, { kind: 'entry', title: `You can stream ${org.name}'s matches`, body: `${user.name} added you to its Media list.`, link: { pathname: '/organisation/[id]', params: { id: org.id } } });
+    return mediaOf({ orgId: req.params.id });
+  });
+  app.delete<{ Params: { id: string; userId: string } }>('/organisations/:id/media/:userId', async (req) => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can change its Media list');
+    await prisma.membership.deleteMany({ where: { userId: req.params.userId, orgId: req.params.id, role: 'media' } });
+    return mediaOf({ orgId: req.params.id });
+  });
+  // Deputy approvers: they approve transfers, squads and held players while the league's admins are away.
+  app.get<{ Params: { id: string } }>('/organisations/:id/deputies', async (req) => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can see its deputy approvers');
+    return mediaOf({ orgId: req.params.id }, 'transferOfficer');
+  });
+  app.post<{ Params: { id: string } }>('/organisations/:id/deputies', async (req) => {
+    const user = requireUser(req);
+    const { identifier } = z.object({ identifier: z.string().trim().min(5) }).parse(req.body);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can name deputy approvers');
+    const other = await findAccount(identifier, user.country);
+    if (!(await prisma.membership.count({ where: { userId: other.id, orgId: req.params.id, role: 'transferOfficer' } }))) await prisma.membership.create({ data: { id: newId('mem'), userId: other.id, orgId: req.params.id, role: 'transferOfficer' } });
+    const org = await prisma.organisation.findUniqueOrThrow({ where: { id: req.params.id } });
+    await notify(other.id, { kind: 'entry', title: `You approve players for ${org.name}`, body: `${user.name} made you a deputy approver: transfers, squads and held players.`, link: { pathname: '/organisation/[id]', params: { id: org.id } } });
+    return mediaOf({ orgId: req.params.id }, 'transferOfficer');
+  });
+  app.delete<{ Params: { id: string; userId: string } }>('/organisations/:id/deputies/:userId', async (req) => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can change its deputy approvers');
+    await prisma.membership.deleteMany({ where: { userId: req.params.userId, orgId: req.params.id, role: 'transferOfficer' } });
+    return mediaOf({ orgId: req.params.id }, 'transferOfficer');
+  });
+  app.get<{ Params: { id: string } }>('/teams/:id/media', async (req) => {
+    const user = requireUser(req);
+    if (!isClubAdmin(user, req.params.id)) throw forbidden('Only the club’s admins can see its Media list');
+    return mediaOf({ clubId: req.params.id });
+  });
+  app.post<{ Params: { id: string } }>('/teams/:id/media', async (req) => {
+    const user = requireUser(req);
+    const { identifier } = z.object({ identifier: z.string().trim().min(5) }).parse(req.body);
+    if (!isClubAdmin(user, req.params.id)) throw forbidden('Only a club admin can add to its Media list');
+    const other = await findAccount(identifier, user.country);
+    if (!(await prisma.membership.count({ where: { userId: other.id, clubId: req.params.id, role: 'media' } }))) await prisma.membership.create({ data: { id: newId('mem'), userId: other.id, clubId: req.params.id, role: 'media' } });
+    const team = await prisma.team.findUniqueOrThrow({ where: { id: req.params.id } });
+    await notify(other.id, { kind: 'entry', title: `You can stream ${team.name}'s matches`, body: `${user.name} added you to its Media list.`, link: { pathname: '/team/[id]', params: { id: team.id } } });
+    return mediaOf({ clubId: req.params.id });
+  });
+  app.delete<{ Params: { id: string; userId: string } }>('/teams/:id/media/:userId', async (req) => {
+    const user = requireUser(req);
+    if (!isClubAdmin(user, req.params.id)) throw forbidden('Only a club admin can change its Media list');
+    await prisma.membership.deleteMany({ where: { userId: req.params.userId, clubId: req.params.id, role: 'media' } });
+    return mediaOf({ clubId: req.params.id });
   });
 
   // ----------------------------------------------------------- branding
@@ -275,7 +352,7 @@ export async function adminRoutes(app: FastifyInstance) {
     const user = requireUser(req);
     const { playerIds } = z.object({ playerIds: z.array(z.string()).optional() }).parse(req.body ?? {});
     const c = await prisma.competition.findUnique({ where: { id: req.params.id } });
-    if (!c || !isLeagueAdmin(user, c.orgId)) throw forbidden('Only a league admin can approve squads');
+    if (!c || !mayApprovePlayers(user, c.orgId)) throw forbidden('Only a league admin or deputy approver can approve squads');
     const where = { competitionId: c.id, teamId: req.params.teamId, status: 'active', ...(playerIds ? { playerId: { in: playerIds } } : {}) };
     await prisma.registration.updateMany({ where, data: { approved: true } });
     const admins = await prisma.membership.findMany({ where: { clubId: req.params.teamId, role: 'clubAdmin' }, select: { userId: true } });

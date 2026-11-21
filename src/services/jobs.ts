@@ -49,7 +49,8 @@ export async function payHosts(now = new Date()) {
     if (balance < hostPayoutMinimum(currency)) continue;
     const reference = `HST-${newId('x').slice(-7).toUpperCase()}`;
     // Recorded before any money moves, so a crash after the transfer can never lead to paying again.
-    const payout = await prisma.hostPayout.create({ data: { id: newId('hp'), userId: h.hostUserId, amount: balance, currency, status: 'processing', reference } });
+    // Dated by this run, so the "already tried today" check above compares like with like.
+    const payout = await prisma.hostPayout.create({ data: { id: newId('hp'), userId: h.hostUserId, amount: balance, currency, status: 'processing', reference, at: now } });
     try {
       // The host's bank or wallet is held by Flutterwave against their account; development pays at once.
       const sent = await payments().transfer({ amount: balance, currency, institutionCode: '', accountRef: h.hostUserId, narration: 'Ovalcast stream earnings', reference });

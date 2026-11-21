@@ -12,7 +12,7 @@ import { ApiError, badRequest, conflict, forbidden, notFound } from '~/lib/error
 import { newId } from '~/lib/ids';
 import { oneAtATime } from '~/lib/lock';
 import { registerPlayers, tellAboutHolds } from '~/lib/registration';
-import { clubAdminIds, isClubAdmin, isLeagueAdmin, matchData, notify, toCompetition, toDeduction, toEntry, toMatch, toRegistration, toTransfer } from '~/lib/repo';
+import { clubAdminIds, isClubAdmin, isLeagueAdmin, matchData, mayApprovePlayers, playerApproverIds, notify, toCompetition, toDeduction, toEntry, toMatch, toRegistration, toTransfer } from '~/lib/repo';
 import { T20 } from '~/services/matches';
 import { checkNewLeague, startCheckout } from '~/services/billing';
 import { aggregate, replayedMatches } from '~/services/stats';
@@ -86,6 +86,7 @@ const playerRulesSchema = z.object({
   minMatchesForKnockouts: z.number().int().min(0).max(10),
   squadApproval: z.boolean().optional(),
   transfers: z.object({ windows: z.array(z.object({ name: z.string(), opensOn: z.string(), closesOn: z.string() })), maxPerPlayer: z.number().int().min(1).max(5) }).nullable(),
+  market: z.object({ enabled: z.boolean(), showQyp: z.boolean() }).optional(),
 });
 
 export async function competitionRoutes(app: FastifyInstance) {
@@ -412,6 +413,11 @@ export async function competitionRoutes(app: FastifyInstance) {
     const isPlayer = !!user.playerId && user.playerId === t.playerId;
     const requesting = isClubAdmin(user, t.toTeamId);
     const save = async () => toTransfer(await prisma.transfer.update({ where: { id: t.id }, data: { status: t.status, history: toJson(t.history) } }));
+    // The league's admins and deputy approvers decide next, so a transfer doesn't wait on one person.
+    const toLeague = async (body: string) => {
+      const player = await prisma.player.findUnique({ where: { id: t.playerId }, select: { name: true } });
+      await notify((await playerApproverIds(c.orgId)).filter((id) => id !== user.id), { kind: 'transfer', title: `Transfer to approve: ${player?.name ?? 'a player'} to ${await teamName(t.toTeamId)}`, body: `${c.name}. ${body}`, link: transfersLink(c.id) });
+    };
     const toReleasingClub = async () => {
       t.status = 'awaitingClub';
       await notify(await clubAdminIds(t.fromTeamId), { kind: 'transfer', title: 'A club wants one of your players', body: `${c.name}. The player has agreed. Release or turn down.`, link: transfersLink(c.id) });
@@ -430,6 +436,7 @@ export async function competitionRoutes(app: FastifyInstance) {
       if (!(t.status === 'rejected' && t.history.at(-1)?.by === 'releasingClub')) throw conflict('Only a transfer the releasing club turned down can go to the league');
       t.status = 'disputed';
       t.history.push({ status: 'disputed', at, by: isPlayer && !requesting ? 'player' : 'requestingClub', note });
+      await toLeague('The releasing club refused and the league is asked to decide.');
       return save();
     }
     if (t.status === 'awaitingPlayer') {
@@ -465,10 +472,11 @@ export async function competitionRoutes(app: FastifyInstance) {
       if (!isClubAdmin(user, t.fromTeamId)) throw forbidden('Only the releasing club can answer this');
       t.status = response === 'approve' ? 'awaitingLeague' : 'rejected';
       t.history.push({ status: t.status, at, by: 'releasingClub', note });
+      if (t.status === 'awaitingLeague') await toLeague('Both clubs and the player agree. Approve or turn down.');
       return save();
     }
     if (t.status === 'awaitingLeague' || t.status === 'disputed') {
-      if (!isLeagueAdmin(user, c.orgId)) throw forbidden('Only a league admin can approve transfers');
+      if (!mayApprovePlayers(user, c.orgId)) throw forbidden('Only a league admin or deputy approver can approve transfers');
       if (response === 'approve') {
         // The window and limits are checked again at approval.
         const { regs, verdict } = await transferCheck(t, t.id);
@@ -487,6 +495,8 @@ export async function competitionRoutes(app: FastifyInstance) {
       }
       t.status = response === 'approve' ? 'approved' : 'rejected';
       t.history.push({ status: t.status, at, by: 'league', note });
+      // Signed: the player comes off the league's marketplace.
+      if (response === 'approve') await prisma.marketListing.updateMany({ where: { competitionId: c.id, playerId: t.playerId, status: 'active' }, data: { status: 'closed' } });
       const uid = await playerUser(t.playerId);
       if (uid) await notify([uid], { kind: 'transfer', title: response === 'approve' ? (t.kind === 'dual' ? `You can now play for ${await teamName(t.toTeamId)} too` : `You’ve moved to ${await teamName(t.toTeamId)}`) : 'The league turned down your transfer', body: c.name, link: transfersLink(c.id) });
       return save();
@@ -523,7 +533,7 @@ export async function competitionRoutes(app: FastifyInstance) {
     const reg = await prisma.registration.findUnique({ where: { id: req.params.id } });
     if (!reg || reg.status !== 'active') throw notFound('Squad place');
     const c = await comp(reg.competitionId);
-    if (!isLeagueAdmin(user, c.orgId)) throw forbidden('Only a league admin can release a held player');
+    if (!mayApprovePlayers(user, c.orgId)) throw forbidden('Only a league admin or deputy approver can release a held player');
     if (!reg.heldReason) throw conflict('This player isn’t held');
     const saved = await prisma.registration.update({ where: { id: reg.id }, data: { heldReason: null, overrideNote: note, overrideBy: user.name } });
     const player = await prisma.player.findUnique({ where: { id: reg.playerId }, select: { name: true } });
@@ -571,6 +581,23 @@ export async function competitionRoutes(app: FastifyInstance) {
   });
 
   // ------------------------------------------------------------- deductions
+  // A league admin changes the league's player rules: second clubs and the QYP age, other leagues,
+  // guests, squad approval, transfer windows and the marketplace. Players already registered stay;
+  // the rules apply to registrations and transfers from now on.
+  app.put<{ Params: { id: string } }>('/competitions/:id/player-rules', async (req) => {
+    const user = requireUser(req);
+    const c = await comp(req.params.id);
+    if (!isLeagueAdmin(user, c.orgId)) throw forbidden('Only a league admin can change the player rules');
+    const rules = playerRulesSchema.parse(req.body);
+    for (const w of rules.transfers?.windows ?? []) {
+      if (Number.isNaN(Date.parse(w.opensOn)) || Number.isNaN(Date.parse(w.closesOn))) throw badRequest(`Give dates for ${w.name || 'each window'}`);
+      if (w.closesOn < w.opensOn) throw badRequest(`${w.name || 'A window'} closes before it opens`);
+    }
+    if (rules.market?.showQyp && rules.multiClub.maxAge === undefined) throw badRequest('Set a QYP age (second clubs for players this age or under) to show QYP players');
+    const saved = await prisma.competition.update({ where: { id: c.id }, data: { playerRules: toJson(rules) } });
+    return toCompetition(saved);
+  });
+
   app.get<{ Params: { id: string } }>('/competitions/:id/deductions', async (req) => (await prisma.deduction.findMany({ where: { competitionId: req.params.id }, orderBy: { at: 'desc' } })).map(toDeduction));
   app.post<{ Params: { id: string } }>('/competitions/:id/deductions', async (req) => {
     const user = requireUser(req);

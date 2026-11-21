@@ -16,6 +16,8 @@ import { publish, subscribe, trackFeed } from '~/lib/live';
 import { isClubAdmin, isLeagueAdmin, matchData, notify, toCompetition, toMatch, toPlayer, toRegistration } from '~/lib/repo';
 import { ballEventsFor, ballStored, forgetDevice, forgetSetups, getMatch, getMatchCached, matchChangedAt, refreshFromEvents, saveMatch, scoringDevice, storedBall, T20 } from '~/services/matches';
 import { checkMatchStart } from '~/services/billing';
+import { mayStream, organisesMatch, orgOfMatch } from '~/lib/streaming';
+import { normaliseIdentifier } from '@/engine';
 import { emitPartnerEvent } from '~/services/partners';
 
 const isScorer = (u: User, m: Match) => m.officials.scorerUserId === u.id;
@@ -39,7 +41,10 @@ async function mayRunToss(u: User, m: Match) {
   throw forbidden('Only the scorer, the organiser or a club admin can run the toss');
 }
 
-const toInvite = (i: P.OfficialInvite): OfficialInvite => ({ ...i, role: i.role as OfficialInvite['role'], status: i.status as OfficialInvite['status'], note: i.note ?? undefined, createdAt: i.createdAt.toISOString() });
+const toInvite = (i: P.OfficialInvite): OfficialInvite => ({ ...i, role: i.role as OfficialInvite['role'], kind: i.kind as OfficialInvite['kind'], streamerShare: i.streamerShare ?? undefined, status: i.status as OfficialInvite['status'], note: i.note ?? undefined, createdAt: i.createdAt.toISOString() });
+
+/** A share as a percentage, for messages: 0.4 -> "40%". */
+const pct = (share: number) => `${Math.round(share * 100)}%`;
 
 const ballSchema = z.object({
   clientId: z.string().min(4).max(80),
@@ -435,6 +440,54 @@ export async function matchRoutes(app: FastifyInstance) {
     return toInvite(inv);
   });
 
+  // ------------------------------------------------------------- streamers
+  // The organiser invites someone to stream, with the part of the host share they'll get (0 to 100%).
+  app.post<{ Params: { id: string } }>('/matches/:id/streamers', async (req) => {
+    const user = requireUser(req);
+    // Who: their account id, or the email or phone number on their account.
+    const b = z.object({ userId: z.string().optional(), identifier: z.string().trim().min(3).optional(), share: z.number().min(0).max(1), note: z.string().trim().max(200).optional() }).parse(req.body);
+    const m = await getMatch(req.params.id);
+    if (!(await organisesMatch(user, m))) throw forbidden('Only the match’s organiser can invite streamers');
+    if (m.status === 'completed') throw conflict('This match has finished');
+    const who = b.identifier ? (b.identifier.includes('@') ? { email: normaliseIdentifier(b.identifier, user.country) } : { phone: normaliseIdentifier(b.identifier, user.country) }) : b.userId ? { id: b.userId } : undefined;
+    if (!who) throw badRequest('Say who: their email or phone number');
+    const invitee = await prisma.user.findUnique({ where: who, select: { id: true, name: true } });
+    if (!invitee) throw notFound('Ovalcast account with that email or phone. Ask them to sign up first');
+    if (m.officials.streamers?.some((s) => s.userId === invitee.id)) throw conflict(`${invitee.name} can already stream this match`);
+    if (await prisma.officialInvite.count({ where: { matchId: m.id, userId: invitee.id, role: 'streamer', status: 'pending' } })) throw conflict(`${invitee.name} already has an invitation`);
+    const inv = await prisma.officialInvite.create({ data: { id: newId('oinv'), matchId: m.id, userId: invitee.id, userName: invitee.name, role: 'streamer', kind: 'invite', streamerShare: b.share, invitedBy: user.id, invitedByName: user.name, status: 'pending', note: b.note ?? null } });
+    await notify(invitee.id, { kind: 'official', title: `${user.name} invited you to stream a match`, body: b.share ? `You'd get ${pct(b.share)} of the host share of passes and donations while you stream. Accept or decline on the match.` : 'Accept or decline on the match.', link: { pathname: '/match/[id]', params: { id: m.id } } });
+    return toInvite(inv);
+  });
+
+  // Anyone signed in can ask to stream, proposing their part of the host share; the organiser decides.
+  app.post<{ Params: { id: string } }>('/matches/:id/streamers/requests', async (req) => {
+    const user = requireUser(req);
+    const b = z.object({ share: z.number().min(0).max(1), note: z.string().trim().max(200).optional() }).parse(req.body);
+    const m = await getMatch(req.params.id);
+    if (m.status === 'completed') throw conflict('This match has finished');
+    if (await mayStream(user, m)) throw conflict('You can already stream this match');
+    if (await prisma.officialInvite.count({ where: { matchId: m.id, userId: user.id, role: 'streamer', status: 'pending' } })) throw conflict('You’ve already asked; the organiser will answer');
+    const inv = await prisma.officialInvite.create({ data: { id: newId('oinv'), matchId: m.id, userId: user.id, userName: user.name, role: 'streamer', kind: 'request', streamerShare: b.share, invitedBy: user.id, invitedByName: user.name, status: 'pending', note: b.note ?? null } });
+    const orgId = await orgOfMatch(m);
+    const organisers = orgId
+      ? (await prisma.membership.findMany({ where: { orgId, role: { in: ['leagueAdmin', 'owner'] } }, select: { userId: true } })).map((x) => x.userId)
+      : [...(m.createdBy ? [m.createdBy] : []), ...(await prisma.membership.findMany({ where: { clubId: { in: [m.homeTeamId, m.awayTeamId] }, role: 'clubAdmin' }, select: { userId: true } })).map((x) => x.userId)];
+    await notify([...new Set(organisers)], { kind: 'official', title: `${user.name} asks to stream a match`, body: `${b.share ? `They ask for ${pct(b.share)} of the host share while they stream. ` : ''}Approve or decline on the match.`, link: { pathname: '/match/[id]', params: { id: m.id } } });
+    return toInvite(inv);
+  });
+
+  // The organiser takes someone's permission to stream away (a stream they're running carries on until ended).
+  app.delete<{ Params: { id: string; userId: string } }>('/matches/:id/streamers/:userId', async (req) => {
+    const user = requireUser(req);
+    const m = await getMatch(req.params.id);
+    if (!(await organisesMatch(user, m))) throw forbidden('Only the match’s organiser can remove streamers');
+    m.officials = { ...m.officials, streamers: (m.officials.streamers ?? []).filter((x) => x.userId !== req.params.userId) };
+    await saveMatch(m);
+    await notify(req.params.userId, { kind: 'official', title: 'You can no longer stream a match', body: `${user.name} removed you as a streamer.`, link: { pathname: '/match/[id]', params: { id: m.id } } });
+    return m;
+  });
+
   // The organiser sets the whole match up at once: the ground, date, home side and every official.
   // People with accounts are invited (they're listed when they accept); officials without one are
   // listed by name straight away. Anyone taken off is told, and their invitation withdrawn.
@@ -542,9 +595,24 @@ export async function matchRoutes(app: FastifyInstance) {
       if (inv.invitedBy !== user.id && !(await canManageOfficials(user, m))) throw forbidden('Only whoever sent it can withdraw this');
       return toInvite(await prisma.officialInvite.update({ where: { id: inv.id }, data: { status: 'withdrawn' } }));
     }
-    if (inv.userId !== user.id) throw forbidden('This invitation is for someone else');
+    // A request to stream is answered by the organiser; an invitation by the person invited.
+    if (inv.kind === 'request') {
+      if (!(await organisesMatch(user, m))) throw forbidden('Only the match’s organiser can answer a request to stream');
+    } else if (inv.userId !== user.id) throw forbidden('This invitation is for someone else');
     const status = response === 'accept' ? 'accepted' : 'declined';
     const saved = await prisma.officialInvite.update({ where: { id: inv.id }, data: { status } });
+    if (inv.role === 'streamer') {
+      if (status === 'accepted') {
+        // Approved, with the share both sides agreed (the organiser set it, or approved the one asked for).
+        const streamer = { userId: inv.userId, name: inv.userName, share: inv.streamerShare ?? 0 };
+        m.officials = { ...m.officials, streamers: [...(m.officials.streamers ?? []).filter((x) => x.userId !== inv.userId), streamer] };
+        await saveMatch(m);
+      }
+      const told = inv.kind === 'request' ? inv.userId : inv.invitedBy;
+      const share = inv.streamerShare ? ` They get ${pct(inv.streamerShare)} of the host share of passes and donations while they stream.` : '';
+      await notify(told, { kind: 'official', title: inv.kind === 'request' ? (status === 'accepted' ? 'You can stream the match' : 'Your request to stream was declined') : `${user.name} ${status === 'accepted' ? 'will' : 'won’t'} stream your match`, body: status === 'accepted' ? `Approved.${share}` : 'Nothing changes.', link: { pathname: '/match/[id]', params: { id: m.id } } });
+      return toInvite(saved);
+    }
     if (status === 'accepted') {
       if (inv.role === 'scorer') {
         m.officials = { ...m.officials, scorerUserId: user.id, scorerName: user.name };

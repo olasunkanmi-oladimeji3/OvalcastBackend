@@ -23,6 +23,7 @@ import { emitPartnerEvent } from '~/services/partners';
 import { ballEventsFor } from '~/services/matches';
 import { replayedMatches } from '~/services/stats';
 import { copyBirthDateToPlayers } from '~/routes/auth';
+import { mayStream, organisesMatch } from '~/lib/streaming';
 import { eligibilityFor } from '~/routes/matches';
 
 const HANDOVER_MINUTES = 10;
@@ -189,9 +190,8 @@ export async function featureRoutes(app: FastifyInstance) {
     const { source } = z.object({ source: z.enum(['phone', 'encoder']) }).parse(req.body);
     const m = await getMatch(req.params.id);
     const orgId = await orgOfMatch(m.competitionId);
-    // Organisers decide who streams their matches: league admins, the scorer, and the two clubs' admins.
-    const allowed = orgId ? isLeagueAdmin(user, orgId) || m.officials.scorerUserId === user.id || isClubAdmin(user, m.homeTeamId) || isClubAdmin(user, m.awayTeamId) : m.createdBy === user.id || m.officials.scorerUserId === user.id;
-    if (!allowed) throw forbidden(orgId ? 'Only people the league allows can stream its matches' : 'Only the people running this friendly can stream it');
+    // The organiser, streamers they approved for this match, and the club's or league's Media list.
+    if (!(await mayStream(user, m))) throw forbidden('Only the organiser, or someone they’ve approved to stream, can stream this match. Ask to stream it from the match page.');
     // One live stream per match, even when two requests arrive together (a double tap, two devices):
     // the match's lock is held while checking and creating.
     const { stream: s, created } = await prisma.$transaction(async (tx) => {
@@ -228,7 +228,7 @@ export async function featureRoutes(app: FastifyInstance) {
     const s = await prisma.stream.findUnique({ where: { id: req.params.id }, include: { match: { select: { competitionId: true } } } });
     if (!s) throw notFound('Stream');
     const orgId = await orgOfMatch(s.match.competitionId ?? undefined);
-    if (s.startedBy !== user.id && !(orgId && isLeagueAdmin(user, orgId))) throw forbidden('Only whoever started the stream can end it');
+    if (s.startedBy !== user.id && !(await organisesMatch(user, await getMatch(s.matchId)))) throw forbidden('Only whoever started the stream, or the match’s organiser, can end it');
     await prisma.stream.update({ where: { id: s.id }, data: { status: 'ended' } });
     await refundIfMostlyDown(s.id);
     // Watchers and the match page hear it has ended.

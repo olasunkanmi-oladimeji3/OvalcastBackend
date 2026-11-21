@@ -517,8 +517,12 @@ model OfficialInvite {
   matchId       String   @map("match_id")
   userId        String   @map("user_id")
   userName      String   @map("user_name")
-  /// scorer | umpire
+  /// scorer | umpire | groundsman | streamer
   role          String
+  /// invite: the organiser asked them. request: they asked the organiser (streamers only).
+  kind          String   @default("invite")
+  /// Streamers: their agreed part of the host share (0.4 = 40%) for passes and donations while they stream.
+  streamerShare Float?   @map("streamer_share")
   invitedBy     String   @map("invited_by")
   invitedByName String   @map("invited_by_name")
   /// pending | accepted | declined | withdrawn
@@ -779,6 +783,11 @@ model PassOffer {
   hostName   String  @map("host_name")
   /// Offer a season pass for the rest of the competition too.
   season     Boolean @default(false)
+  /// payPerView: viewers buy a pass at `price`. donation: free to watch; viewers give what they like
+  /// (at least the minimum), with up to three `suggested` amounts.
+  mode       String  @default("payPerView")
+  /// int[]: suggested donation amounts, in the offer's currency.
+  suggested  Json?
   match      Match   @relation(fields: [matchId], references: [id], onDelete: Cascade)
 
   @@map("pass_offers")
@@ -803,6 +812,9 @@ model MatchPass {
   /// The platform share this sale used (0.25 = 25% of the price after the payment fee). Null on sales from before rates were recorded; past sales never change.
   platformShare Float?   @map("platform_share")
   hostShare     Int?     @map("host_share")
+  /// An approved streamer's agreed part of the host share for this sale, and who they are.
+  streamerUserId String? @map("streamer_user_id")
+  streamerAmount Int     @default(0) @map("streamer_amount")
   at            DateTime @default(now()) @db.Timestamptz
   user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -818,6 +830,7 @@ model PassSale {
   matchId    String   @map("match_id")
   hostUserId String   @map("host_user_id")
   passes     Int
+  donations  Int      @default(0)
   gross      Int
   fees       Int
   host       Int
@@ -1096,4 +1109,56 @@ model StaffAction {
   @@index([targetKind, targetId])
   @@index([staffId, at])
   @@map("staff_actions")
+}
+
+/// A gift to a match's stream (donation streams are free to watch). Split like a pass: the payment
+/// fee, the platform share at the time, then the host share, part of which may go to an approved streamer.
+model Donation {
+  id             String   @id
+  matchId        String   @map("match_id")
+  /// Null for a guest, who gives an email for the receipt instead.
+  userId         String?  @map("user_id")
+  email          String?
+  /// Shown on the thank-you list unless anonymous.
+  donorName      String   @map("donor_name")
+  anonymous      Boolean  @default(false)
+  message        String?
+  amount         Int
+  currency       String
+  paidWith       String   @map("paid_with")
+  fee            Int
+  platformShare  Float    @map("platform_share")
+  hostShare      Int      @map("host_share")
+  hostUserId     String   @map("host_user_id")
+  streamerUserId String?  @map("streamer_user_id")
+  streamerAmount Int      @default(0) @map("streamer_amount")
+  at             DateTime @default(now()) @db.Timestamptz
+
+  @@index([matchId, at])
+  @@index([hostUserId])
+  @@index([streamerUserId])
+  @@map("donations")
+}
+
+/// A player on a league's marketplace: open to offers (the player said so) or listed by their club.
+/// Closed when they withdraw it, or when a transfer for the player in this league is approved.
+model MarketListing {
+  id            String   @id
+  competitionId String   @map("competition_id")
+  playerId      String   @map("player_id")
+  /// The player's club when it was listed.
+  teamId        String   @map("team_id")
+  /// open (the player) | listed (their club)
+  kind          String
+  /// move | dual | either
+  wants         String   @default("either")
+  note          String?
+  /// active | closed
+  status        String   @default("active")
+  createdBy     String   @map("created_by")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([competitionId, status])
+  @@index([playerId])
+  @@map("market_listings")
 }
