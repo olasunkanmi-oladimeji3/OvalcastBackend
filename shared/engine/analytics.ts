@@ -123,7 +123,20 @@ export interface MatchAwards {
   /** Suggested from the impact score; the organiser confirms it. */
   playerOfMatch?: PlayerImpact;
   impacts: PlayerImpact[];
+  /** The same awards within each team: its best batter, bowler, fielder and top impact. */
+  byTeam: Record<string, TeamAwards>;
 }
+
+export interface TeamAwards {
+  bestBatter?: MatchAwards['bestBatter'];
+  bestBowler?: MatchAwards['bestBowler'];
+  bestFielder?: MatchAwards['bestFielder'];
+  top?: PlayerImpact;
+}
+
+const batterBetter = (a: NonNullable<MatchAwards['bestBatter']>, b?: MatchAwards['bestBatter']) => !b || a.runs > b.runs || (a.runs === b.runs && a.balls < b.balls);
+const bowlerBetter = (a: NonNullable<MatchAwards['bestBowler']>, b?: MatchAwards['bestBowler']) => a.balls > 0 && (!b || a.wickets > b.wickets || (a.wickets === b.wickets && a.runs / Math.max(1, a.balls) < b.runs / Math.max(1, b.balls)));
+const fieldScore = (f?: MatchAwards['bestFielder']) => (f ? f.catches + f.runOuts * 1.25 + f.stumpings * 1.25 : -1);
 
 /**
  * Impact score: runs with a bonus or penalty for strike rate against the
@@ -131,7 +144,8 @@ export interface MatchAwards {
  * catches, run outs and stumpings. The winning side gets a small bonus.
  */
 export function matchAwards(setup: MatchSetup, state: MatchState, events: BallEvent[]): MatchAwards {
-  const teamOf = new Map(setup.teams.flatMap((t) => t.players.map((p) => [p.id, t.id] as const)));
+  // Substitute fielders (Law 24) count for their own side too.
+  const teamOf = new Map(setup.teams.flatMap((t) => [...t.players, ...(t.substitutes ?? [])].map((p) => [p.id, t.id] as const)));
   const totalRuns = state.innings.reduce((s, i) => s + i.runs, 0);
   const totalBalls = state.innings.reduce((s, i) => s + i.legalBalls, 0);
   const matchRate = totalBalls ? totalRuns / totalBalls : 1.2; // runs per ball
@@ -184,5 +198,28 @@ export function matchAwards(setup: MatchSetup, state: MatchState, events: BallEv
     const cur = bestFielder ? bestFielder.catches + bestFielder.runOuts * 1.25 + bestFielder.stumpings * 1.25 : -1;
     if (score > cur) bestFielder = { playerId, teamId: teamOf.get(playerId) ?? '', ...f };
   }
-  return { bestBatter, bestBowler, bestFielder, playerOfMatch: impacts[0], impacts };
+  // Per team: the same comparisons, over each side's own players.
+  const byTeam: Record<string, TeamAwards> = Object.fromEntries(setup.teams.map((t) => [t.id, {}]));
+  for (const inn of state.innings) {
+    for (const b of inn.batters) {
+      const t = byTeam[teamOf.get(b.playerId) ?? ''];
+      const cand = { playerId: b.playerId, teamId: teamOf.get(b.playerId) ?? '', runs: b.runs, balls: b.balls, fours: b.fours, sixes: b.sixes };
+      if (t && batterBetter(cand, t.bestBatter)) t.bestBatter = cand;
+    }
+    for (const b of inn.bowlers) {
+      const t = byTeam[teamOf.get(b.playerId) ?? ''];
+      const cand = { playerId: b.playerId, teamId: teamOf.get(b.playerId) ?? '', wickets: b.wickets, runs: b.runs, balls: b.balls };
+      if (t && bowlerBetter(cand, t.bestBowler)) t.bestBowler = cand;
+    }
+  }
+  for (const [playerId, f] of fielding) {
+    const t = byTeam[teamOf.get(playerId) ?? ''];
+    const cand = { playerId, teamId: teamOf.get(playerId) ?? '', ...f };
+    if (t && fieldScore(cand) > fieldScore(t.bestFielder)) t.bestFielder = cand;
+  }
+  for (const p of impacts) {
+    const t = byTeam[p.teamId];
+    if (t && !t.top) t.top = p;
+  }
+  return { bestBatter, bestBowler, bestFielder, playerOfMatch: impacts[0], impacts, byTeam };
 }

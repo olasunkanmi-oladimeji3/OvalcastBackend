@@ -3,6 +3,7 @@
 //
 //   npm run jobs   (once, by hand)
 
+import { sendMatchReminders } from './matchNews';
 import type { FastifyBaseLogger } from 'fastify';
 
 /** The API server's logger, or the worker's (scripts/worker.ts). */
@@ -109,5 +110,8 @@ export async function runJobs(log?: JobLog) {
 export function startJobs(log: JobLog, everyMs = 3600_000) {
   const t = setInterval(() => void runJobs(log).catch((e) => log.error(e)), everyMs);
   t.unref();
-  return () => clearInterval(t);
+  // Match reminders need finer timing (two hours before), so they run every five minutes.
+  const r = setInterval(() => void withLock('ovalcast:reminders', () => sendMatchReminders()).catch((e) => log.error(e)), 5 * 60_000);
+  r.unref();
+  return () => (clearInterval(t), clearInterval(r));
 }

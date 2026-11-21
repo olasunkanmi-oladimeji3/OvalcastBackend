@@ -852,6 +852,10 @@ export interface Leaderboards {
   sixes: LeaderboardEntry[];
   strikeRate: LeaderboardEntry[];
   economy: LeaderboardEntry[];
+  /** Catches, run-outs and stumpings (keepers' stumpings included). */
+  fielding?: LeaderboardEntry[];
+  /** Player of the match awards: the organiser's choice, or the suggested one where none was confirmed. */
+  playerOfMatch?: LeaderboardEntry[];
 }
 
 /**
@@ -1425,7 +1429,8 @@ export interface OvalcastApi {
   signOut(token: string): Promise<void>;
   // POST /me/contacts  (add or re-verify an email or phone for the signed-in user; then verifyCode)
   // An email gets a code to verify; a phone number is saved straight away as a contact (user comes back).
-  addContact(value: string): Promise<{ identifier: string; code?: CodeSent; user?: User }>;
+  /** `confirm`: a new phone number typed a second time. Changing a number needs a verified email. */
+  addContact(value: string, confirm?: string): Promise<{ identifier: string; code?: CodeSent; user?: User }>;
 
   // GET /me
   getMe(): Promise<User>;

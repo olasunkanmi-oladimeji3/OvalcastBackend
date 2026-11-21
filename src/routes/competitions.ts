@@ -4,7 +4,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { Competition, Leaderboards, Match, Payment, SeriesSummary, Standings, Transfer } from '@/api/types';
-import { buildBracket, canTransfer, fitGroups, registrationCheck, roundRobin, standings, tableResult, transferOpen } from '@/engine';
+import { buildBracket, canTransfer, fitGroups, matchAwards, registrationCheck, roundRobin, standings, tableResult, transferOpen } from '@/engine';
 import { entryShareFor } from '~/lib/shares';
 import { prisma, toJson } from '~/db/client';
 import { requireUser } from '~/lib/auth';
@@ -129,7 +129,15 @@ export async function competitionRoutes(app: FastifyInstance) {
 
   app.get<{ Params: { id: string } }>('/competitions/:id/leaderboards', async (req): Promise<Leaderboards> => {
     const c = await comp(req.params.id);
-    const figs = aggregate(await replayedMatches({ competitionId: c.id }));
+    const replays = await replayedMatches({ competitionId: c.id });
+    const figs = aggregate(replays);
+    // Player of the match: the organiser's choice, else the suggestion from the impact score.
+    const poms = new Map<string, number>();
+    for (const r of replays) {
+      if (r.match.status !== 'completed') continue;
+      const id = r.match.playerOfMatchId ?? matchAwards(r.setup, r.state, r.events).playerOfMatch?.playerId;
+      if (id) poms.set(id, (poms.get(id) ?? 0) + 1);
+    }
     const regs = await prisma.registration.findMany({ where: { competitionId: c.id } });
     const teamOf = (pid: string) => regs.find((r) => r.playerId === pid && r.status === 'active')?.teamId ?? regs.find((r) => r.playerId === pid)?.teamId ?? '';
     const list = [...figs].filter(([pid]) => teamOf(pid));
@@ -142,6 +150,8 @@ export async function competitionRoutes(app: FastifyInstance) {
       sixes: top((f) => f.sixes, (f) => `${f.runs} runs`, (f) => f.sixes > 0),
       strikeRate: top((f) => (f.runs / f.balls) * 100, (f) => `${f.runs} off ${f.balls}`, (f) => f.balls >= 30),
       economy: top((f) => (f.runsConceded / f.ballsBowled) * 6, (f) => `${Math.floor(f.ballsBowled / 6)} overs`, (f) => f.ballsBowled >= 36, true),
+      fielding: top((f) => f.catches + f.runOuts + f.stumpings, (f) => [f.catches ? `${f.catches} ct` : '', f.runOuts ? `${f.runOuts} ro` : '', f.stumpings ? `${f.stumpings} st` : ''].filter(Boolean).join(', '), (f) => f.catches + f.runOuts + f.stumpings > 0),
+      playerOfMatch: [...poms].filter(([pid]) => teamOf(pid)).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([pid, n]) => ({ playerId: pid, teamId: teamOf(pid), value: n, detail: `${figs.get(pid)?.matches ?? n} matches` })),
     };
   });
 

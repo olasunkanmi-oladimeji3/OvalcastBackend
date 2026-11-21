@@ -4,6 +4,7 @@
 // Live matches are held in memory: the match, its balls and its two XIs. A new ball is
 // one insert and one update, and viewers read the held copy instead of Postgres.
 
+import { tellResult } from './matchNews';
 import type { Match, Player } from '@/api/types';
 import { replay, type BallEvent, type MatchSetup, type PlayingConditions } from '@/engine';
 import { json, prisma } from '~/db/client';
@@ -176,7 +177,7 @@ export async function refreshFromEvents(m: Match, statusBefore?: Match['status']
   }
   const wasCompleted = (statusBefore ?? (await prisma.match.findUnique({ where: { id: m.id }, select: { status: true } }))?.status) === 'completed';
   await saveMatch(m);
-  if (m.status === 'completed' && !wasCompleted) await tellFollowers(m);
+  if (m.status === 'completed' && !wasCompleted) await tellResult(m, setup, state, events);
   if (m.status === 'completed' && m.winnerTo && m.result?.winnerTeamId) {
     const next = await getMatch(m.winnerTo.matchId);
     if (m.winnerTo.side === 'home') next.homeTeamId = m.result.winnerTeamId;
@@ -188,8 +189,3 @@ export async function refreshFromEvents(m: Match, statusBefore?: Match['status']
   return m;
 }
 
-/** People following either club or the competition hear the result. */
-async function tellFollowers(m: Match) {
-  const users = await followerIds([m.homeTeamId, m.awayTeamId], m.competitionId ? [m.competitionId] : []);
-  if (users.length && m.result) await notify(users, { kind: 'result', title: m.result.text, body: 'A club you follow has finished a match.', link: { pathname: '/match/[id]', params: { id: m.id } } });
-}

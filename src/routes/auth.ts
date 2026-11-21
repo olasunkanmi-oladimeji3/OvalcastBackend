@@ -268,8 +268,15 @@ export async function authRoutes(app: FastifyInstance) {
 
   app.post('/me/contacts', async (req) => {
     const user = requireUser(req);
-    const value = normalise(z.object({ value: z.string().min(3) }).parse(req.body).value);
+    const b = z.object({ value: z.string().min(3), confirm: z.string().optional() }).parse(req.body);
+    const value = normalise(b.value);
     if (!isEmail(value) && !phoneRe.test(value)) throw badRequest('Enter an email, or a phone number with its country code');
+    // A new phone number becomes the sign-in straight away and can't be checked by text, so: typed
+    // twice, and only changed (not first added) by someone who has a verified email to fall back on.
+    if (!value.includes('@')) {
+      if (b.confirm !== undefined && normalise(b.confirm) !== value) throw badRequest('The two numbers don’t match. Type the new number again');
+      if (user.phone && user.phone !== value && !(user.email && user.emailVerified)) throw conflict('Add and verify an email first. Your number is how you sign in, so the email lets you get back in if the new number is wrong');
+    }
     const other = await findByIdentifier(value);
     if (other && other.id !== user.id) throw conflict('Another account already uses that');
     // A phone number is saved as a contact (WhatsApp), unverified; an email is verified by code.

@@ -422,6 +422,8 @@ model Match {
   /// A practice match inside one club; kept out of official records.
   practice           Boolean      @default(false)
   playerOfMatchId    String?      @map("player_of_match_id")
+  /// Reminders already sent for this match: dayBefore, twoHours. So a reminder goes out once.
+  remindersSent      String[]     @default([]) @map("reminders_sent")
   outcomeNote        String?      @map("outcome_note")
   /// Overs cut by rain, bad light or a late start: { reason, minutesLost, overs, target, rule, noResult, text, at }.
   reduced            Json?
