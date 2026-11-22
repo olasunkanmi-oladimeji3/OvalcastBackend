@@ -337,9 +337,15 @@ export async function adminRoutes(app: FastifyInstance) {
     return toFixtureRequest(r);
   });
   app.get<{ Params: { id: string } }>('/competitions/:id/fixture-requests', async (req) => {
-    requireUser(req);
-    const ids = (await prisma.match.findMany({ where: { competitionId: req.params.id }, select: { id: true } })).map((m) => m.id);
-    return (await prisma.fixtureRequest.findMany({ where: { matchId: { in: ids } }, orderBy: { createdAt: 'desc' } })).map(toFixtureRequest);
+    const user = requireUser(req);
+    const c = await prisma.competition.findUnique({ where: { id: req.params.id }, select: { orgId: true } });
+    if (!c) throw notFound('Competition');
+    // The league sees every request; a club sees only those for its own matches (they carry its notes).
+    const league = isLeagueAdmin(user, c.orgId);
+    const myClubs = user.memberships.filter((m) => m.role === 'clubAdmin' && m.clubId).map((m) => m.clubId!);
+    if (!league && !myClubs.length) throw forbidden('Fixture requests are for the league and its clubs');
+    const matches = await prisma.match.findMany({ where: { competitionId: req.params.id, ...(league ? {} : { OR: [{ homeTeamId: { in: myClubs } }, { awayTeamId: { in: myClubs } }] }) }, select: { id: true } });
+    return (await prisma.fixtureRequest.findMany({ where: { matchId: { in: matches.map((m) => m.id) } }, orderBy: { createdAt: 'desc' } })).map(toFixtureRequest);
   });
   app.post<{ Params: { id: string } }>('/fixture-requests/:id/respond', async (req) => {
     const user = requireUser(req);

@@ -1,6 +1,10 @@
 // League money: what entry fees have come in, the league's payout account,
 // payouts, withdrawals, fee reminders, and the provider's webhook.
 
+import { logMoney } from '~/lib/moneyLog';
+import { open as openSecret, seal } from '~/lib/secrets';
+import { settleTransfer } from '~/routes/payouts';
+import type { FastifyRequest } from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { LeagueFinance, Payment, PayoutAccount, Settlement } from '@/api/types';
@@ -13,9 +17,9 @@ import { ApiError, badRequest, conflict, forbidden, notFound } from '~/lib/error
 import { newId } from '~/lib/ids';
 import { oneAtATime } from '~/lib/lock';
 import { entryShareFor } from '~/lib/shares';
-import { payments, verifyFlutterwaveHash } from '~/lib/payments';
+import { payInstantly, payments, verifyFlutterwaveHash } from '~/lib/payments';
 import { completeCheckout, requireFeature } from '~/services/billing';
-import { clubAdminIds, isLeagueAdmin, notify, toCompetition, toEntry } from '~/lib/repo';
+import { clubAdminIds, isLeagueAdmin, notify, toCompetition, toEntry, orgAdminIds } from '~/lib/repo';
 
 const HOLD_MS = 24 * 3600_000;
 
@@ -31,7 +35,7 @@ async function orgOr404(id: string) {
   return o;
 }
 
-const leagueAdminIds = async (orgId: string) => (await prisma.membership.findMany({ where: { orgId, role: { in: ['leagueAdmin', 'owner'] } }, select: { userId: true } })).map((m) => m.userId);
+const leagueAdminIds = orgAdminIds;
 
 /** Every paid entry of an organisation's competitions, with the entry rows to update. */
 async function paidEntries(orgId: string) {
@@ -78,14 +82,18 @@ export async function financeRoutes(app: FastifyInstance) {
   });
 
   app.post('/payouts/resolve', async (req) => {
-    requireUser(req);
+    const user = requireUser(req);
+    // Looking up who owns an account number is for setting up where a league is paid, nothing else.
+    const orgAdmin = user.memberships.some((m) => m.orgId && (m.role === 'owner' || m.role === 'leagueAdmin'));
+    const earner = !orgAdmin && (await prisma.passSale.count({ where: { hostUserId: user.id } })) > 0;
+    if (!orgAdmin && !earner) throw forbidden('Bank lookups are for organisation admins and people with earnings to withdraw');
     const b = z.object({ country: z.string(), kind: z.enum(['bank', 'mobileMoney']), institutionCode: z.string(), accountNumber: z.string().transform((v) => v.replace(/\D/g, '')) }).parse(req.body);
     return payments().resolve(b);
   });
 
   app.put<{ Params: { id: string } }>('/organisations/:id/payout-account', async (req) => {
     const user = requireUser(req);
-    const b = z.object({ kind: z.enum(['bank', 'mobileMoney']), institutionCode: z.string(), accountNumber: z.string().transform((v) => v.replace(/\D/g, '')).optional(), schedule: z.enum(['auto', 'weekly', 'manual']), password: z.string().min(1, 'Enter your password') }).parse(req.body);
+    const b = z.object({ kind: z.enum(['bank', 'mobileMoney']), institutionCode: z.string(), accountNumber: z.string().transform((v) => v.replace(/\D/g, '')).optional(), schedule: z.enum(['auto', 'weekly', 'manual']), password: z.string().min(1, 'Enter your password').max(200) }).parse(req.body);
     if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only a league admin can change where the league is paid');
     const row = await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { passwordHash: true } });
     if (!(await verifyPassword(row.passwordHash, b.password))) throw new ApiError(401, 'That password is not right');
@@ -106,12 +114,15 @@ export async function financeRoutes(app: FastifyInstance) {
       const same = !!previous && previous.institutionCode === inst.code && previous.last4 === b.accountNumber.slice(-4);
       data = {
         kind: inst.kind, institution: inst.name, institutionCode: inst.code, last4: b.accountNumber.slice(-4), accountName, provider: 'flutterwave', subaccountCode, schedule: b.schedule,
+        // Kept encrypted for manual withdrawals; never shown or logged.
+        accountNumberEnc: seal(b.accountNumber),
         verifiedAt: new Date(), changedBy: user.id, changedByName: user.name,
         // A new account holds payouts for a day, so a stolen login cannot quietly redirect money.
         holdUntil: previous && !same ? new Date(Date.now() + HOLD_MS) : previous?.holdUntil ?? null,
       };
     }
     const saved = await prisma.payoutAccount.upsert({ where: { orgId: org.id }, create: { orgId: org.id, ...data }, update: data });
+    await logMoney(req, { userId: user.id, orgId: org.id, action: 'payoutAccount', detail: `${saved.institution} ending ${saved.last4}, ${saved.schedule}` });
     const moved = !!b.accountNumber && saved.holdUntil && saved.holdUntil > new Date();
     await notify(await leagueAdminIds(org.id), {
       kind: 'payment',
@@ -125,30 +136,47 @@ export async function financeRoutes(app: FastifyInstance) {
   app.post<{ Params: { id: string } }>('/organisations/:id/withdrawals', async (req) => {
     const user = requireUser(req);
     if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only a league admin can withdraw');
+    // The admin's password, every time: league money only leaves with it.
+    const { password } = z.object({ password: z.string().min(1, 'Enter your password').max(200) }).parse(req.body ?? {});
+    const row = await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { passwordHash: true } });
+    if (!(await verifyPassword(row.passwordHash, password))) throw new ApiError(401, 'That password is not right');
     // One withdrawal per league at a time: a second one waits, then finds nothing left to send.
-    return oneAtATime(`withdraw:${req.params.id}`, () => withdraw(req.params.id, user));
+    return oneAtATime(`withdraw:${req.params.id}`, () => withdraw(req, req.params.id, user));
   });
 
-  async function withdraw(orgId: string, user: { id: string; name: string }) {
+  async function withdraw(req: FastifyRequest, orgId: string, user: { id: string; name: string }) {
     const org = await orgOr404(orgId);
     const account = org.payoutAccount;
     if (!account) throw conflict('Add a payout account first');
     if (account.schedule !== 'manual') throw conflict('This league is paid out automatically');
     if (account.holdUntil && account.holdUntil > new Date()) throw conflict('Payouts are paused for 24 hours after the account changed');
+    if (!account.accountNumberEnc) throw conflict('Enter the account number once more (Payout account, Change) so withdrawals can be sent to it');
     const { comps, entries } = await paidEntries(org.id);
     const waiting = entries.filter((e) => e.payment?.status === 'paid' && e.payment.method !== 'cash' && !e.payment.settlementId);
     if (!waiting.length) throw conflict('Nothing to withdraw yet');
     const currency = org.currency as FinanceCurrency;
     const amount = summariseFinance({ currency, competitions: comps, entries, schedule: 'manual' }).totals.awaiting;
-    const { reference } = await payments().transfer({ amount, currency, institutionCode: account.institutionCode, accountRef: account.subaccountCode, narration: `${org.shortName} entry fees`, reference: `WDL-${Date.now().toString(36).toUpperCase().slice(-7)}` });
+    const reference = `WDL-${newId('x').slice(-8).toUpperCase()}`;
     const id = newId('stl');
     const st = await prisma.$transaction(async (tx) => {
       const created = await tx.settlement.create({ data: { id, orgId: org.id, amount, currency, paymentCount: waiting.length, status: 'processing', reference, accountLabel: `${account.institution} ending ${account.last4}`, kind: 'withdrawal' } });
       for (const e of waiting) await tx.entry.update({ where: { id: e.id }, data: { payment: toJson({ ...e.payment, settlementId: id }) } });
       return created;
     });
+    await logMoney(req, { userId: user.id, orgId: org.id, action: 'withdrawal', amount, currency, reference, detail: st.accountLabel });
+    // Recorded first, then sent: a crash in between can never send it twice.
+    try {
+      await payments().transfer({ amount, currency, institutionCode: account.institutionCode, accountRef: account.subaccountCode, accountNumber: openSecret(account.accountNumberEnc), narration: `${org.shortName} entry fees`, reference });
+    } catch (e) {
+      if ((e as { status?: number }).status === 400) {
+        await settleTransfer(reference, 'failed');
+        throw conflict(`The bank turned it down: ${e instanceof Error ? e.message : 'check the account'}. The money is still there to withdraw`);
+      }
+      req.log.error(e, `league withdrawal ${reference}: no clear answer`);
+    }
+    if (payInstantly()) await settleTransfer(reference, 'successful');
     await notify(await leagueAdminIds(org.id), { kind: 'payment', title: `${user.name} withdrew league money`, body: `To ${st.accountLabel}. Reference ${st.reference}.`, link: { pathname: '/money/[orgId]', params: { orgId: org.id } } });
-    return toSettlement(st);
+    return toSettlement((await prisma.settlement.findUniqueOrThrow({ where: { id: st.id } })));
   }
 
   app.post<{ Params: { id: string } }>('/entries/:id/remind', async (req, reply) => {
@@ -170,6 +198,19 @@ export async function financeRoutes(app: FastifyInstance) {
 export async function webhookRoutes(app: FastifyInstance) {
   app.post('/webhooks/flutterwave', async (req, reply) => {
     if (!verifyFlutterwaveHash(req.headers['verif-hash'] as string | undefined)) return reply.status(401).send({ message: 'Bad signature' });
+    // A transfer finished (a withdrawal): ask Flutterwave for its status rather than trust the body.
+    const t = z.object({ event: z.literal('transfer.completed'), data: z.object({ id: z.union([z.number(), z.string()]), reference: z.string() }).passthrough() }).safeParse(req.body);
+    if (t.success) {
+      const eventId = `flutterwave:transfer:${t.data.data.id}`;
+      try {
+        await prisma.webhookEvent.create({ data: { id: eventId, provider: 'flutterwave', type: t.data.event } });
+      } catch {
+        return reply.status(200).send({ ok: true, duplicate: true });
+      }
+      const status = await payments().transferStatus(String(t.data.data.id));
+      if (status.status !== 'pending' && status.reference === t.data.data.reference) await settleTransfer(status.reference, status.status);
+      return reply.status(200).send({ ok: true });
+    }
     const evt = z.object({ event: z.string(), data: z.object({ id: z.union([z.number(), z.string()]), tx_ref: z.string(), status: z.string(), amount: z.number(), currency: z.string() }).passthrough() }).parse(req.body);
     const eventId = `flutterwave:${evt.event}:${evt.data.id}`;
     try {

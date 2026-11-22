@@ -184,6 +184,8 @@ export interface Player {
   id: ID;
   teamId: ID;
   name: string;
+  /** Their photo, when they or their club added one. */
+  photoUrl?: string;
   shortName: string;
   role: PlayerRole;
   battingHand: 'R' | 'L';
@@ -211,6 +213,7 @@ export interface PlayerCareer {
 export interface PlayerSeason {
   playerId: ID;
   name: string;
+  photoUrl?: string;
   teamId: ID;
   /** The calendar year the season covers, and every year they've played in. */
   year: number;
@@ -1076,7 +1079,33 @@ export interface HostEarnings {
   nextPayoutOn: ISODate;
   /** Per match: passes sold and donations received, and your part (as host, or as an approved streamer). */
   matches: { matchId: ID; passes: number; donations?: number; gross: number; fees: number; host: number; at: ISODate }[];
-  payouts: { id: ID; amount: number; status: 'processing' | 'paid'; reference: string; at: ISODate }[];
+  /** processing: sent, waiting for the bank's confirmation. failed: turned down, back in the balance. */
+  payouts: { id: ID; amount: number; status: 'processing' | 'paid' | 'failed' | 'pending'; reference: string; at: ISODate; accountLabel?: string }[];
+}
+
+/** Where a streamer or host is paid. Only the last four digits are ever shown. */
+export interface MyPayoutAccount {
+  kind: 'bank' | 'mobileMoney';
+  institution: string;
+  last4: string;
+  accountName: string;
+  verifiedAt: ISODate;
+  /** Withdrawals pause until then, 24 hours after the account changed. */
+  holdUntil?: ISODate;
+}
+
+/** A payout staff should look at: refused, unconfirmed after two days, or waiting to be paid by hand. */
+export interface PayoutAttention {
+  kind: 'host' | 'league';
+  id: ID;
+  who: string;
+  whoId: ID;
+  amount: number;
+  currency: string;
+  status: string;
+  reference: string;
+  account?: string;
+  at: ISODate;
 }
 
 /** Viewer-hours an organisation has bought so fans watch its matches free in the Ovalcast player. */
@@ -1598,6 +1627,9 @@ export interface OvalcastApi {
   // PATCH /teams/:id , POST /teams/:id/logo (multipart in production)
   updateTeam(teamId: ID, patch: Partial<Pick<Team, 'name' | 'shortName' | 'colors' | 'homeGround' | 'city'>>): Promise<Team>;
   uploadTeamLogo(teamId: ID, fileUri: string): Promise<Team>;
+  /** POST/DELETE /players/:id/photo : by the player or their club. */
+  uploadPlayerPhoto(playerId: ID, fileUri: string): Promise<Player>;
+  removePlayerPhoto(playerId: ID): Promise<Player>;
   // POST /teams/:id/staff , DELETE /teams/:id/staff/:staffId
   addStaff(teamId: ID, input: Omit<StaffMember, 'id'>): Promise<Team>;
   removeStaff(teamId: ID, staffId: ID): Promise<Team>;
@@ -1631,7 +1663,15 @@ export interface OvalcastApi {
   // PUT /organisations/:id/payout-account
   setPayoutAccount(orgId: ID, input: PayoutAccountInput): Promise<PayoutAccount>;
   // POST /organisations/:id/withdrawals  (manual schedule: pays everything the provider is holding)
-  withdrawLeagueFunds(orgId: ID): Promise<Settlement>;
+  /** Needs the admin's password every time; logged with the device. */
+  withdrawLeagueFunds(orgId: ID, password: string): Promise<Settlement>;
+  /** Streamers and hosts: their own payout account (password, name checked) and withdrawals on request. */
+  getMyPayoutAccount(): Promise<MyPayoutAccount | null>;
+  setMyPayoutAccount(input: { institutionCode: string; accountNumber: string; password: string }): Promise<MyPayoutAccount>;
+  withdrawEarnings(password: string, currency?: string): Promise<{ id: ID; amount: number; currency: string; status: string; reference: string; accountLabel: string; at: ISODate }>;
+  /** Staff: payouts needing attention, and recording one paid by hand. */
+  listPayoutsNeedingAttention(): Promise<PayoutAttention[]>;
+  markPayoutPaid(kind: 'host' | 'league', id: ID, note: string): Promise<{ ok: true }>;
 
   // GET /community?regionId= , POST /community
   listPosts(regionId: ID): Promise<CommunityPost[]>;

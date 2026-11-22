@@ -55,6 +55,8 @@ export interface PaymentsProvider {
    * couldn't be sent automatically (no full account number on file) and staff must pay it.
    */
   transfer(input: { amount: number; currency: string; institutionCode: string; accountRef: string; accountNumber?: string; narration: string; reference: string }): Promise<{ reference: string; manual?: boolean }>;
+  /** Where a transfer is, by Flutterwave's transfer id (from its webhook): never trust the webhook body alone. */
+  transferStatus(id: string): Promise<{ reference: string; status: 'successful' | 'failed' | 'pending' }>;
   /** Gives a card or transfer payment back to whoever paid, by Flutterwave's transaction id. */
   refund(input: { transactionId: string; amount: number }): Promise<{ status: string }>;
 }
@@ -73,6 +75,7 @@ export const devFlutterwave: PaymentsProvider = {
   checkout: async ({ txRef }) => ({ link: `https://checkout.flutterwave.com/dev/${txRef}` }),
   verify: async (id) => ({ id, txRef: '', status: 'successful', amount: 0, currency: 'NGN', paymentType: 'card', paidAt: new Date().toISOString() }),
   transfer: async ({ reference }) => ({ reference }),
+  transferStatus: async (id) => ({ reference: id, status: 'successful' }),
   refund: async () => ({ status: 'completed' }),
 };
 
@@ -152,6 +155,10 @@ export const liveFlutterwave: PaymentsProvider = {
     if (!accountNumber) return { reference, manual: true };
     const r = await flw<{ reference: string }>('POST', '/transfers', { account_bank: institutionCode, account_number: accountNumber, amount, currency, narration, reference, debit_currency: currency });
     return { reference: r.reference ?? reference };
+  },
+  async transferStatus(id) {
+    const d = await flw<{ reference: string; status: string }>('GET', `/transfers/${encodeURIComponent(id)}`);
+    return { reference: d.reference, status: d.status === 'SUCCESSFUL' ? 'successful' : d.status === 'FAILED' ? 'failed' : 'pending' };
   },
   async refund({ transactionId, amount }) {
     const r = await flw<{ status?: string }>('POST', `/transactions/${encodeURIComponent(transactionId)}/refund`, { amount });

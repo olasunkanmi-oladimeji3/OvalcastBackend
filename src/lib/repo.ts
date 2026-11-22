@@ -84,6 +84,7 @@ export const toPlayer = (p: P.Player): Player => ({
   guestMatchId: p.guestMatchId ?? undefined,
   minor: p.minor || undefined,
   guardianConsent: p.minor ? p.guardianConsent : undefined,
+  ...(p.photoUrl ? { photoUrl: p.photoUrl } : {}),
 });
 
 export const toCompetition = (c: P.Competition): Competition => ({
@@ -237,6 +238,12 @@ export async function notify(userIds: string | string[], n: Omit<AppNotification
 /** Everyone who approves a league's players: its admins and its deputy approvers. */
 export async function playerApproverIds(orgId: string) {
   const rows = await prisma.membership.findMany({ where: { orgId, role: { in: ['leagueAdmin', 'owner', 'transferOfficer'] } }, select: { userId: true } });
+  return [...new Set(rows.map((r) => r.userId))];
+}
+
+/** An organisation's owner and league admins. */
+export async function orgAdminIds(orgId: string) {
+  const rows = await prisma.membership.findMany({ where: { orgId, role: { in: ['owner', 'leagueAdmin'] } }, select: { userId: true } });
   return [...new Set(rows.map((r) => r.userId))];
 }
 

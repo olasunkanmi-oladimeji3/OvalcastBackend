@@ -149,6 +149,32 @@ export async function teamRoutes(app: FastifyInstance) {
     return toInvite(await prisma.playerInvite.update({ where: { id: inv.id }, data: { status: 'cancelled' } }));
   });
 
+  // ------------------------------------------------------------- photos
+  // A player's photo: added by the player themselves or their club's admins. PNG, JPEG or WebP, up to 5 MB.
+  const mayEditPhoto = async (user: User, playerId: string) => {
+    const p = await prisma.player.findUnique({ where: { id: playerId }, select: { id: true, teamId: true, claimedByUserId: true } });
+    if (!p) throw notFound('Player');
+    if (user.playerId !== p.id && p.claimedByUserId !== user.id && !isClubAdmin(user, p.teamId)) throw forbidden('Only the player or their club can change their photo');
+    return p;
+  };
+  app.post<{ Params: { id: string } }>('/players/:id/photo', async (req) => {
+    const user = requireUser(req);
+    const p = await mayEditPhoto(user, req.params.id);
+    const file = await req.file();
+    if (!file) throw badRequest('Attach the photo as a file named image');
+    if (!/^image\/(png|jpe?g|webp)$/.test(file.mimetype)) throw badRequest('Use a PNG, JPEG or WebP photo');
+    const body = await file.toBuffer();
+    if (body.length > 5 * 1024 * 1024) throw badRequest('Use a photo under 5 MB');
+    const key = `players/${p.id}-${Date.now().toString(36)}.${file.mimetype.split('/')[1].replace('jpeg', 'jpg')}`;
+    await storage.put(key, body, file.mimetype);
+    return masked(toPlayer(await prisma.player.update({ where: { id: p.id }, data: { photoUrl: storage.publicUrl(key) } })), user);
+  });
+  app.delete<{ Params: { id: string } }>('/players/:id/photo', async (req) => {
+    const user = requireUser(req);
+    const p = await mayEditPhoto(user, req.params.id);
+    return masked(toPlayer(await prisma.player.update({ where: { id: p.id }, data: { photoUrl: null } })), user);
+  });
+
   // ------------------------------------------------------------- season review
   // One calendar year: figures, player of the match awards, and the match with the highest impact.
   app.get<{ Params: { id: string } }>('/players/:id/season', async (req): Promise<PlayerSeason> => {
@@ -181,7 +207,7 @@ export async function teamRoutes(app: FastifyInstance) {
       best = { matchId: r.match.id, date: r.match.startsAt, against: side === r.match.homeTeamId ? r.match.awayTeamId : r.match.homeTeamId, ...(bat ? { runs: bat.runs, balls: bat.balls } : {}), ...(bowl && bowl.balls ? { wickets: bowl.wickets, conceded: bowl.runs } : {}), ...(r.match.result?.text ? { result: r.match.result.text } : {}) };
     }
     return {
-      playerId: p.id, name: masked(toPlayer(p), req.user).name, teamId: p.teamId, year, years, matches: f?.matches ?? 0,
+      playerId: p.id, name: masked(toPlayer(p), req.user).name, ...(masked(toPlayer(p), req.user).name !== 'Junior player' && toPlayer(p).photoUrl ? { photoUrl: toPlayer(p).photoUrl } : {}), teamId: p.teamId, year, years, matches: f?.matches ?? 0,
       batting: { innings: f?.innings ?? 0, runs: f?.runs ?? 0, balls: f?.balls ?? 0, notOuts: f?.notOuts ?? 0, high: f?.high ?? 0, fifties: f?.fifties ?? 0, hundreds: f?.hundreds ?? 0, fours: f?.fours ?? 0, sixes: f?.sixes ?? 0 },
       bowling: { balls: f?.ballsBowled ?? 0, runs: f?.runsConceded ?? 0, wickets: f?.wickets ?? 0, best: f?.best ? `${f.best.wickets}/${f.best.runs}` : '–' },
       fielding: { catches: f?.catches ?? 0, runOuts: f?.runOuts ?? 0, stumpings: f?.stumpings ?? 0 },

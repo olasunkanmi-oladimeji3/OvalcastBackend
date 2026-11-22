@@ -139,7 +139,10 @@ export async function competitionRoutes(app: FastifyInstance) {
       if (id) poms.set(id, (poms.get(id) ?? 0) + 1);
     }
     const regs = await prisma.registration.findMany({ where: { competitionId: c.id } });
-    const teamOf = (pid: string) => regs.find((r) => r.playerId === pid && r.status === 'active')?.teamId ?? regs.find((r) => r.playerId === pid)?.teamId ?? '';
+    // Each player's club here, looked up once (active registration first), not searched per player.
+    const clubOf = new Map<string, string>();
+    for (const r of regs) if (r.status === 'active' || !clubOf.has(r.playerId)) clubOf.set(r.playerId, r.teamId);
+    const teamOf = (pid: string) => clubOf.get(pid) ?? '';
     const list = [...figs].filter(([pid]) => teamOf(pid));
     type F = (typeof list)[0][1];
     const top = (value: (f: F) => number, detail: (f: F) => string, keep: (f: F) => boolean = () => true, asc = false) =>

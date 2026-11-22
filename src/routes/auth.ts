@@ -146,7 +146,7 @@ export async function authRoutes(app: FastifyInstance) {
   app.post('/auth/sign-up', async (req) => {
     const body = z
       .object({
-        name: z.string().trim().min(1, 'Add your name'), email: z.string().optional(), phone: z.string().optional(), password: z.string().min(8, 'Use a password of at least 8 characters'), city: z.string().optional(), country: z.string().trim().max(60).optional(),
+        name: z.string().trim().min(1, 'Add your name'), email: z.string().optional(), phone: z.string().optional(), password: z.string().min(8, 'Use a password of at least 8 characters').max(200, 'Use a password of at most 200 characters'), city: z.string().optional(), country: z.string().trim().max(60).optional(),
         dateOfBirth,
         // Player: anyone who plays, officiates, coaches, runs a club or follows. Organisation: a body that runs competitions.
         accountType: z.enum(['player', 'organisation']).default('player'),
@@ -180,7 +180,7 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   app.post('/auth/sign-in', async (req): Promise<SignInResult> => {
-    const body = z.object({ identifier: z.string().min(3), password: z.string().min(1) }).parse(req.body);
+    const body = z.object({ identifier: z.string().min(3).max(200), password: z.string().min(1).max(200) }).parse(req.body);
     const identifier = normalise(body.identifier);
     const u = await findByIdentifier(identifier);
     if (u?.lockedUntil && u.lockedUntil.getTime() > Date.now()) throw new ApiError(429, 'Too many wrong passwords. Try again in 15 minutes, or reset your password.');
@@ -226,7 +226,7 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   app.post('/auth/reset-password', async (req) => {
-    const body = z.object({ identifier: z.string().min(3), code: z.string().length(6), newPassword: z.string().min(8, 'Use a password of at least 8 characters') }).parse(req.body);
+    const body = z.object({ identifier: z.string().min(3), code: z.string().length(6), newPassword: z.string().min(8, 'Use a password of at least 8 characters').max(200, 'Use a password of at most 200 characters') }).parse(req.body);
     const identifier = normalise(body.identifier);
     await checkCode(identifier, body.code, 'reset');
     const u = await findByIdentifier(identifier);

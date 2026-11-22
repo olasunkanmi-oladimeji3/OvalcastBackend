@@ -50,7 +50,9 @@ const RULES: Rule[] = [
   { name: 'invites', by: 'user', limit: 100, windowSec: HOUR, applies: is('POST', '/teams/:id/invites', '/competitions/:id/invites', '/matches/:id/officials/invite', '/teams/:id/admins', '/organisations/:id/admins', '/entries/:id/remind'), message: 'Too many invitations sent' },
   { name: 'contacts', by: 'user', limit: 10, windowSec: HOUR, applies: is('POST', '/me/contacts'), message: 'Too many contact lookups' },
   { name: 'bank-lookups', by: 'user', limit: 20, windowSec: HOUR, applies: is('POST', '/payouts/resolve'), message: 'Too many bank account lookups' },
-  { name: 'payments', by: 'user', limit: 30, windowSec: HOUR, applies: is('POST', '/entries/:id/pay', '/matches/:id/passes', '/me/subscription', '/me/wallet/top-ups', '/organisations/:id/viewer-credits', '/organisations/:id/withdrawals'), message: 'Too many payment attempts' },
+  { name: 'payments', by: 'user', limit: 30, windowSec: HOUR, applies: is('POST', '/entries/:id/pay', '/matches/:id/passes', '/me/subscription', '/me/wallet/top-ups', '/organisations/:id/viewer-credits', '/organisations/:id/withdrawals', '/organisations/:id/plan'), message: 'Too many payment attempts' },
+  // Guests can give without an account, so donations are counted by network too: each starts a checkout.
+  { name: 'donations', by: 'userOrIp', limit: 20, windowSec: HOUR, applies: is('POST', '/matches/:id/donations'), message: 'Too many donations started. Try again later' },
 
   // ---- Posting.
   { name: 'stories', by: 'user', limit: 20, windowSec: HOUR, applies: is('POST', '/stories'), message: 'Too many stories posted' },

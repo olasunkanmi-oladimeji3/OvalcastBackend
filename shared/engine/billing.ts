@@ -89,7 +89,7 @@ export function splitPass(price: number, currency: FinanceCurrency, platformShar
   return { gross: price, providerFee: fee, platform, host: net - platform };
 }
 
-/** Host earnings are paid weekly once the balance reaches ₦5,000, or the same value locally; smaller balances roll over. */
+/** Hosts withdraw their earnings when they choose, from ₦5,000 or the same value locally. */
 export const HOST_PAYOUT_MINIMUM = 5000;
 export const hostPayoutMinimum = (currency: FinanceCurrency = 'NGN') => localPrice(HOST_PAYOUT_MINIMUM, currency);
 

@@ -117,6 +117,16 @@ function sendHit(req: FastifyRequest, reply: FastifyReply, c: Cached, rule: Rule
   return reply.send(c.body);
 }
 
+/** Writes that change nothing anyone else reads (see onSend). */
+const HARMLESS = new Set([
+  `POST ${P}/streams/:id/view`,
+  `POST ${P}/streams/:id/health`,
+  `POST ${P}/me/push-tokens`,
+  `DELETE ${P}/me/push-tokens`,
+  `POST ${P}/auth/sign-in`,
+  `POST ${P}/auth/code`,
+]);
+
 const matchIdIn = (url: string) => /\/matches\/([^/?]+)/.exec(url)?.[1];
 
 // Bumped by every clear. A read that started before a change finishes after it with the old
@@ -155,6 +165,10 @@ export async function responseCache(app: FastifyInstance, opts: { onWrite?: (url
   app.addHook('onSend', async (req, reply, payload) => {
     // A change: drop what it affects before the reply leaves, so the client's next read is fresh.
     if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS' && reply.statusCode < 400) {
+      // Changes no shared answer or signed-in account depends on: a viewer opening a stream, the
+      // streaming phone's health reports, a phone registering for notifications. Clearing every
+      // cache for them would make a busy match slow for everyone.
+      if (HARMLESS.has(`${req.method} ${req.routeOptions.url ?? ''}`)) return payload;
       const matchId = matchIdIn(req.url);
       // A ball changes one match; anything else may change any page.
       if (matchId && /\/balls(\/|$|\?)/.test(req.url)) emit('responses:match', matchId);

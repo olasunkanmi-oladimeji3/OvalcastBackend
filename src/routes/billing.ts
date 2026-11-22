@@ -15,6 +15,7 @@ import { isLeagueAdmin } from '~/lib/repo';
 import { limitsOf } from '~/services/access';
 import { canHost, issuePass, leaguePlan, matchesThisMonth, passFor, recordDonation, startCheckout, userPlan, walletCurrency } from '~/services/billing';
 import { organisesMatch } from '~/lib/streaming';
+import { hostBalances } from './payouts';
 import { getMatch } from '~/services/matches';
 import { emit, on } from '~/lib/bus';
 import { TtlCache, registerCache } from '~/lib/cache';
@@ -236,16 +237,15 @@ export async function billingRoutes(app: FastifyInstance) {
   // -------------------------------------------------------- host earnings
   app.get('/me/earnings', async (req): Promise<HostEarnings> => {
     const user = requireUser(req);
-    const [sales, payouts] = await Promise.all([prisma.passSale.findMany({ where: { hostUserId: user.id }, orderBy: { at: 'desc' } }), prisma.hostPayout.findMany({ where: { userId: user.id, status: { not: 'failed' } }, orderBy: { at: 'desc' } })]);
-    const earned = sales.reduce((s, x) => s + x.host, 0);
-    const paid = payouts.reduce((s, x) => s + x.amount, 0);
+    const [sales, payouts, balances] = await Promise.all([prisma.passSale.findMany({ where: { hostUserId: user.id }, orderBy: { at: 'desc' } }), prisma.hostPayout.findMany({ where: { userId: user.id }, orderBy: { at: 'desc' }, take: 50 }), hostBalances(user.id)]);
     // Hosts are paid in the currency of the passes they sell: their latest match's.
     const currency = (sales[0]?.currency as FinanceCurrency | undefined) ?? currencyForCountry(user.country);
     return {
-      // What the host keeps of each pass after the payment fee, at today's rate.
-      currency, share: Math.round((1 - (await platformShareFor(user.id))) * 1000) / 1000, balance: earned - paid, minimumPayout: hostPayoutMinimum(currency), nextPayoutOn: nextHostPayout(new Date()).toISOString(),
+      // What the host keeps of each pass after the payment fee, at today's rate. Failed payouts are
+      // listed but don't count against the balance: the money came back.
+      currency, share: Math.round((1 - (await platformShareFor(user.id))) * 1000) / 1000, balance: balances.get(currency) ?? 0, minimumPayout: hostPayoutMinimum(currency), nextPayoutOn: nextHostPayout(new Date()).toISOString(),
       matches: sales.map((x) => ({ matchId: x.matchId, passes: x.passes, donations: x.donations, gross: x.gross, fees: x.fees, host: x.host, at: x.at.toISOString() })),
-      payouts: payouts.map((x) => ({ id: x.id, amount: x.amount, status: x.status as 'processing' | 'paid', reference: x.reference, at: x.at.toISOString() })),
+      payouts: payouts.map((x) => ({ id: x.id, amount: x.amount, status: x.status as HostEarnings['payouts'][number]['status'], reference: x.reference, at: (x.paidAt ?? x.at).toISOString(), ...(x.accountLabel ? { accountLabel: x.accountLabel } : {}) })),
     };
   });
 

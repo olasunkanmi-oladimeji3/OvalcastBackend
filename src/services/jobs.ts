@@ -14,7 +14,7 @@ import { prisma } from '~/db/client';
 import { newId } from '~/lib/ids';
 import { withLock } from '~/lib/lock';
 import { payments } from '~/lib/payments';
-import { notify } from '~/lib/repo';
+import { notify, orgAdminIds } from '~/lib/repo';
 import { forgetSetups, getMatch, saveMatch } from './matches';
 
 /** Pro ends at the period's end when cancelled; unpaid renewals get three days' grace, then end. */
@@ -50,7 +50,6 @@ export async function expireSubscriptions(now = new Date()) {
   return { ended: ending.length, pastDue: late.count, lapsed: lapsed.length, reminded };
 }
 
-const orgAdminIds = async (orgId: string) => (await prisma.membership.findMany({ where: { orgId, role: { in: ['owner', 'leagueAdmin'] } }, select: { userId: true } })).map((m) => m.userId);
 
 /** An organisation's subscription ended: back to Free, unless Ovalcast put it on the plan by contract or another subscription still covers it. */
 async function organisationPlanEnded(orgId: string, title: string, body: string) {
@@ -59,50 +58,6 @@ async function organisationPlanEnded(orgId: string, title: string, body: string)
   if (!org || org.planContract || still) return;
   await prisma.organisation.update({ where: { id: orgId }, data: { plan: 'free' } });
   await notify(await orgAdminIds(orgId), { kind: 'payment', title, body, link: { pathname: '/organisation/[id]', params: { id: orgId } } });
-}
-
-/**
- * Mondays: every host with at least the local minimum waiting (₦5,000 or the same value)
- * is paid, in each currency they earned in. Smaller balances roll over.
- */
-export async function payHosts(now = new Date()) {
-  if (now.getUTCDay() !== 1) return { paid: 0, failed: 0 };
-  const since = new Date(now.getTime() - 20 * 3600_000);
-  const earned = await prisma.passSale.groupBy({ by: ['hostUserId', 'currency'], _sum: { host: true } });
-  let paid = 0;
-  let failed = 0;
-  for (const h of earned) {
-    const currency = (h.currency ?? (await walletCurrency(h.hostUserId))) as FinanceCurrency;
-    // Already tried today in this currency: skip, so a repeated run never pays twice.
-    if (await prisma.hostPayout.count({ where: { userId: h.hostUserId, currency, at: { gte: since } } })) continue;
-    // What's been paid, or may have been (processing): a payout Flutterwave refused doesn't count.
-    const out = await prisma.hostPayout.aggregate({ where: { userId: h.hostUserId, currency, status: { not: 'failed' } }, _sum: { amount: true } });
-    const balance = (h._sum.host ?? 0) - (out._sum.amount ?? 0);
-    if (balance < hostPayoutMinimum(currency)) continue;
-    const reference = `HST-${newId('x').slice(-7).toUpperCase()}`;
-    // Recorded before any money moves, so a crash after the transfer can never lead to paying again.
-    // Dated by this run, so the "already tried today" check above compares like with like.
-    const payout = await prisma.hostPayout.create({ data: { id: newId('hp'), userId: h.hostUserId, amount: balance, currency, status: 'processing', reference, at: now } });
-    try {
-      // The host's bank or wallet is held by Flutterwave against their account; development pays at once.
-      const sent = await payments().transfer({ amount: balance, currency, institutionCode: '', accountRef: h.hostUserId, narration: 'Ovalcast stream earnings', reference });
-      // Couldn't go automatically: it waits in the backoffice for staff to pay, and the host is told so.
-      await prisma.hostPayout.update({ where: { id: payout.id }, data: { status: sent.manual ? 'pending' : 'paid' } });
-      await notify(h.hostUserId, sent.manual
-        ? { kind: 'payment', title: `${formatMoney(balance, currency)} stream earnings are being paid`, body: `Ovalcast pays them to your account within two working days. Reference ${reference}.` }
-        : { kind: 'payment', title: `${formatMoney(balance, currency)} stream earnings paid`, body: `Reference ${reference}.` });
-      paid += 1;
-    } catch (e) {
-      failed += 1;
-      // Flutterwave said no (a 4xx): nothing was sent, so the balance is paid with next week's run.
-      // No clear answer (a timeout, a 5xx): it may have gone, so it stays processing for staff to
-      // check against Flutterwave's transfer list. Either way, one host never stops the others.
-      const refused = (e as { status?: number }).status === 400;
-      if (refused) await prisma.hostPayout.update({ where: { id: payout.id }, data: { status: 'failed' } });
-      console.error(`[payouts] ${reference} for ${h.hostUserId}: ${refused ? 'refused' : 'no clear answer, left processing'}: ${e instanceof Error ? e.message : e}`);
-    }
-  }
-  return { paid, failed };
 }
 
 /** Ended streams that were down for over 30% of the time: their passes are refunded, once. */
@@ -151,7 +106,7 @@ export async function endStaleMatches(now = new Date()) {
     let organisers = [m.createdBy, m.scorerUserId].filter((u): u is string => !!u);
     if (m.competitionId) {
       const c = await prisma.competition.findUnique({ where: { id: m.competitionId }, select: { orgId: true } });
-      if (c) organisers = [...organisers, ...(await prisma.membership.findMany({ where: { orgId: c.orgId, role: { in: ['owner', 'leagueAdmin'] } }, select: { userId: true } })).map((x) => x.userId)];
+      if (c) organisers = [...organisers, ...(await orgAdminIds(c.orgId))];
       if (quiet < 7 * DAY) {
         if (m.remindersSent.includes('stale')) continue;
         await prisma.match.update({ where: { id: m.id }, data: { remindersSent: { push: 'stale' } } });
@@ -174,7 +129,7 @@ export async function endStaleMatches(now = new Date()) {
 
 /** One machine at a time: two running together could both pay the same streamer. */
 export async function runJobs(log?: JobLog) {
-  const r = await withLock('ovalcast:jobs', async () => ({ subscriptions: await expireSubscriptions(), streams: await refundDroppedStreams(), hosts: await payHosts(), accounts: await deleteAccounts(), stale: await endStaleMatches() }));
+  const r = await withLock('ovalcast:jobs', async () => ({ subscriptions: await expireSubscriptions(), streams: await refundDroppedStreams(), accounts: await deleteAccounts(), stale: await endStaleMatches() }));
   if (r) log?.info(r, 'scheduled jobs');
   else log?.info('scheduled jobs: another machine is running them');
   return r;

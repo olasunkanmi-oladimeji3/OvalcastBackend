@@ -14,7 +14,7 @@ import { requireUser } from '~/lib/auth';
 import { badRequest, conflict, forbidden, notFound } from '~/lib/errors';
 import { newId } from '~/lib/ids';
 import { publish, subscribe, trackFeed } from '~/lib/live';
-import { isClubAdmin, isLeagueAdmin, matchData, notify, toCompetition, toMatch, toPlayer, toRegistration } from '~/lib/repo';
+import { isClubAdmin, isLeagueAdmin, matchData, notify, toCompetition, toMatch, toPlayer, toRegistration, orgAdminIds } from '~/lib/repo';
 import { ballEventsFor, ballStored, forgetDevice, forgetSetups, getMatch, getMatchCached, matchChangedAt, refreshFromEvents, saveMatch, scoringDevice, storedBall, T20 } from '~/services/matches';
 import { checkMatchStart } from '~/services/billing';
 import { mayStream, organisesMatch, orgOfMatch } from '~/lib/streaming';
@@ -488,7 +488,7 @@ export async function matchRoutes(app: FastifyInstance) {
     const inv = await prisma.officialInvite.create({ data: { id: newId('oinv'), matchId: m.id, userId: user.id, userName: user.name, role: 'streamer', kind: 'request', streamerShare: b.share, invitedBy: user.id, invitedByName: user.name, status: 'pending', note: b.note ?? null } });
     const orgId = await orgOfMatch(m);
     const organisers = orgId
-      ? (await prisma.membership.findMany({ where: { orgId, role: { in: ['leagueAdmin', 'owner'] } }, select: { userId: true } })).map((x) => x.userId)
+      ? (await orgAdminIds(orgId))
       : [...(m.createdBy ? [m.createdBy] : []), ...(await prisma.membership.findMany({ where: { clubId: { in: [m.homeTeamId, m.awayTeamId] }, role: 'clubAdmin' }, select: { userId: true } })).map((x) => x.userId)];
     await notify([...new Set(organisers)], { kind: 'official', title: `${user.name} asks to stream a match`, body: `${b.share ? `They ask for ${pct(b.share)} of the host share while they stream. ` : ''}Approve or decline on the match.`, link: { pathname: '/match/[id]', params: { id: m.id } } });
     return toInvite(inv);

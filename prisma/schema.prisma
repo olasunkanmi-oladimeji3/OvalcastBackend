@@ -76,6 +76,7 @@ model User {
   // Who follows a club or league, when its result goes out: follows @> {"teamIds":[id]}.
   @@index([follows(ops: JsonbPathOps)], type: Gin)
   @@map("users")
+  payoutAccount   UserPayoutAccount?
 }
 
 model Membership {
@@ -240,6 +241,8 @@ model Player {
   @@index([teamId])
   @@index([guestMatchId])
   @@map("players")
+  /// The player's photo (uploaded by them or their club). Never shown for an under-18 without a guardian's agreement.
+  photoUrl        String?        @map("photo_url")
 }
 
 model PlayerInvite {
@@ -667,6 +670,8 @@ model PayoutAccount {
   changedByName   String       @map("changed_by_name")
   /// Payouts pause for 24 hours after the account changes.
   holdUntil       DateTime?    @map("hold_until") @db.Timestamptz
+  /// The full account number, encrypted (lib/secrets), for manual withdrawals. Never shown or logged.
+  accountNumberEnc String?     @map("account_number_enc")
   org             Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   @@map("payout_accounts")
@@ -866,10 +871,15 @@ model HostPayout {
   userId    String   @map("user_id")
   amount    Int
   currency  String?
-  /// processing | paid
+  /// processing (sent, waiting for Flutterwave's confirmation) | paid | failed (the money is back in the balance) | pending (older: for staff to pay)
   status    String
   reference String
   at        DateTime @default(now()) @db.Timestamptz
+  /// Where it went, e.g. "GTBank ending 6789".
+  accountLabel String? @map("account_label")
+  paidAt    DateTime? @map("paid_at") @db.Timestamptz
+  /// Staff's note when they marked it paid by hand (the bank's reference).
+  note      String?
 
   @@index([userId, at])
   @@index([at])
@@ -1193,4 +1203,45 @@ model PushToken {
 
   @@index([userId])
   @@map("push_tokens")
+}
+
+/// Where a streamer or host is paid: their bank or mobile money account. Set by them, with their
+/// password; Flutterwave confirms the name. Payouts pause for 24 hours after it changes.
+model UserPayoutAccount {
+  userId           String    @id @map("user_id")
+  /// bank | mobileMoney
+  kind             String
+  country          String
+  institution      String
+  institutionCode  String    @map("institution_code")
+  last4            String
+  accountName      String    @map("account_name")
+  /// The full account number, encrypted (lib/secrets). Never shown or logged.
+  accountNumberEnc String    @map("account_number_enc")
+  verifiedAt       DateTime  @map("verified_at") @db.Timestamptz
+  holdUntil        DateTime? @map("hold_until") @db.Timestamptz
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_payout_accounts")
+}
+
+/// Every money movement and payout-account change, with who did it and from which device and network.
+model MoneyLog {
+  id        String   @id
+  at        DateTime @default(now()) @db.Timestamptz
+  userId    String   @map("user_id")
+  orgId     String?  @map("org_id")
+  /// withdrawal | payoutAccount | markedPaid | markedFailed
+  action    String
+  amount    Int?
+  currency  String?
+  reference String?
+  deviceId  String?  @map("device_id")
+  ip        String?
+  userAgent String?  @map("user_agent")
+  detail    String?
+
+  @@index([userId, at])
+  @@index([orgId, at])
+  @@map("money_logs")
 }

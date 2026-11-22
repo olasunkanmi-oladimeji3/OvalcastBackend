@@ -10,7 +10,7 @@ import { requestOrigin } from '~/lib/requestContext';
 import { ApiError } from '~/lib/errors';
 import { newId } from '~/lib/ids';
 import { payInstantly, payments } from '~/lib/payments';
-import { notify } from '~/lib/repo';
+import { notify, orgAdminIds } from '~/lib/repo';
 import { allows, limitsOf, planNeededFor } from './access';
 import { emit, on } from '~/lib/bus';
 import { orgOfMatch, rebuildSales, streamerCut } from '~/lib/streaming';
@@ -134,7 +134,7 @@ export async function completeCheckout(id: string, charge: { providerId: string;
     if (current) await prisma.subscription.update({ where: { id: current.id }, data: { status: 'active', interval, amount: c.amount, currency: c.currency, renewsAt: renewsOn(from, interval), cancelAtPeriodEnd: false } });
     else await prisma.subscription.create({ data: { id: newId('sub'), userId: c.userId, orgId, plan: 'organisation', interval, status: 'active', currency: c.currency, amount: c.amount, startedAt: now, renewsAt: renewsOn(now, interval), provider: 'flutterwave' } });
     const org = await prisma.organisation.update({ where: { id: orgId }, data: { plan: 'organisation' } });
-    const admins = (await prisma.membership.findMany({ where: { orgId, role: { in: ['owner', 'leagueAdmin'] } }, select: { userId: true } })).map((m) => m.userId);
+    const admins = await orgAdminIds(orgId);
     await notify(admins, { kind: 'payment', title: current ? `${org.name}: Organisation plan renewed` : `${org.name} is on the Organisation plan`, body: `Reference ${reference}. Unlimited leagues, online entry fees, your branding, website embeds and the API are on.`, link: { pathname: '/organisation/[id]', params: { id: orgId } } });
   }
 
