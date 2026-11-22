@@ -426,6 +426,8 @@ model Match {
   playerOfMatchId    String?      @map("player_of_match_id")
   /// Reminders already sent for this match: dayBefore, twoHours. So a reminder goes out once.
   remindersSent      String[]     @default([]) @map("reminders_sent")
+  /// A league fixture the organiser hasn't published yet: only the league's admins see it.
+  draft              Boolean      @default(false)
   outcomeNote        String?      @map("outcome_note")
   /// Overs cut by rain, bad light or a late start: { reason, minutesLost, overs, target, rule, noResult, text, at }.
   reduced            Json?

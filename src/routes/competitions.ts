@@ -12,8 +12,8 @@ import { ApiError, badRequest, conflict, forbidden, notFound } from '~/lib/error
 import { newId } from '~/lib/ids';
 import { oneAtATime } from '~/lib/lock';
 import { registerPlayers, tellAboutHolds } from '~/lib/registration';
-import { clubAdminIds, isClubAdmin, isLeagueAdmin, matchData, mayApprovePlayers, playerApproverIds, notify, toCompetition, toDeduction, toEntry, toMatch, toRegistration, toTransfer } from '~/lib/repo';
-import { T20 } from '~/services/matches';
+import { clubAdminIds, followerIds, isClubAdmin, isLeagueAdmin, matchData, mayApprovePlayers, playerApproverIds, notify, toCompetition, toDeduction, toEntry, toMatch, toRegistration, toTransfer } from '~/lib/repo';
+import { forgetMatch, T20 } from '~/services/matches';
 import { checkNewLeague, startCheckout } from '~/services/billing';
 import { aggregate, replayedMatches } from '~/services/stats';
 
@@ -341,7 +341,11 @@ export async function competitionRoutes(app: FastifyInstance) {
       const stage = c.stages[0];
       const teamRows = await prisma.team.findMany({ where: { id: { in: c.teamIds } } });
       const created: Match[] = [];
-      if (stage.kind === 'knockout') created.push(...(await insertBracket(c, [...c.teamIds], stage.id, stage.groups[0].id, start)));
+      if (stage.kind === 'knockout') {
+        created.push(...(await insertBracket(c, [...c.teamIds], stage.id, stage.groups[0].id, start)));
+        // A straight knockout's draw is a draft too, until the league publishes it.
+        await prisma.match.updateMany({ where: { id: { in: created.map((m) => m.id) } }, data: { draft: true } });
+      }
       else {
         // Groups are fitted to the teams that came: two teams never end up alone in two groups.
         fitGroups(stage, [...c.teamIds]);
@@ -351,7 +355,7 @@ export async function competitionRoutes(app: FastifyInstance) {
             round.forEach(([home, away], mi) => {
               const when = new Date(start.getTime() + ri * 7 * 86_400_000);
               when.setHours(10 + (mi % 2) * 4, 0, 0, 0);
-              created.push({ id: newId('m'), competitionId: c.id, stageId: stage.id, groupId: g.id, homeTeamId: home, awayTeamId: away, venue: teamRows.find((t) => t.id === home)?.homeGround || 'To be confirmed', startsAt: when.toISOString(), status: 'scheduled', officials: { umpires: [] }, scores: [], locked: false });
+              created.push({ id: newId('m'), competitionId: c.id, stageId: stage.id, groupId: g.id, homeTeamId: home, awayTeamId: away, venue: teamRows.find((t) => t.id === home)?.homeGround || 'To be confirmed', startsAt: when.toISOString(), status: 'scheduled', officials: { umpires: [] }, scores: [], locked: false, draft: true });
             }),
           );
         }
@@ -361,6 +365,39 @@ export async function competitionRoutes(app: FastifyInstance) {
       await saveComp(c);
       await prisma.entry.updateMany({ where: { competitionId: c.id, status: 'pending' }, data: { status: 'declined', respondedAt: new Date() } });
       return created;
+    });
+  });
+
+  // The fixtures are a draft until the league publishes them: then clubs, players and followers see
+  // them and hear they're out.
+  app.post<{ Params: { id: string } }>('/competitions/:id/fixtures/publish', async (req) => {
+    const user = requireUser(req);
+    const c = await comp(req.params.id);
+    if (!isLeagueAdmin(user, c.orgId)) throw forbidden('Only a league admin can publish fixtures');
+    const drafts = await prisma.match.findMany({ where: { competitionId: c.id, draft: true }, select: { id: true, startsAt: true } });
+    if (!drafts.length) throw conflict('There are no draft fixtures to publish');
+    await prisma.match.updateMany({ where: { competitionId: c.id, draft: true }, data: { draft: false } });
+    for (const d of drafts) forgetMatch(d.id);
+    const first = drafts.map((d) => d.startsAt).sort((a, b) => a.getTime() - b.getTime())[0];
+    const admins = await prisma.membership.findMany({ where: { clubId: { in: c.teamIds }, role: 'clubAdmin' }, select: { userId: true } });
+    const fans = await followerIds(c.teamIds, [c.id]);
+    await notify([...new Set([...admins.map((a) => a.userId), ...fans])].filter((u) => u !== user.id), { kind: 'match', title: `${c.name} ${c.season}: the fixtures are out`, body: `${drafts.length} matches, starting ${first.toLocaleDateString('en-GB', { day: 'numeric', month: 'long' })}.`, link: { pathname: '/competition/[id]', params: { id: c.id, tab: 'fixtures' } } });
+    return { published: drafts.length };
+  });
+
+  // Start again: the draft fixtures are thrown away and entries reopen, so the league can add clubs
+  // or change the structure, then build again. Only while nothing has been published or played.
+  app.delete<{ Params: { id: string } }>('/competitions/:id/fixtures/draft', async (req) => {
+    const user = requireUser(req);
+    return oneAtATime(`league:${req.params.id}`, async () => {
+      const c = await comp(req.params.id);
+      if (!isLeagueAdmin(user, c.orgId)) throw forbidden('Only a league admin can discard fixtures');
+      const published = await prisma.match.count({ where: { competitionId: c.id, draft: false } });
+      if (published) throw conflict('Some fixtures are already published. Change them one by one instead');
+      const gone = await prisma.match.deleteMany({ where: { competitionId: c.id, draft: true } });
+      c.status = 'entries';
+      await saveComp(c);
+      return { discarded: gone.count };
     });
   });
 

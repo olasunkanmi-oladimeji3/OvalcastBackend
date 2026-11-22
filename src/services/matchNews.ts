@@ -69,7 +69,7 @@ const dayBefore = (day: string) => {
  */
 export async function sendMatchReminders(now = new Date()) {
   const soon = await prisma.match.findMany({
-    where: { status: 'scheduled', startsAt: { gt: now, lte: new Date(now.getTime() + 36 * 3600_000) }, homeTeamId: { not: '' }, awayTeamId: { not: '' } },
+    where: { status: 'scheduled', draft: false, startsAt: { gt: now, lte: new Date(now.getTime() + 36 * 3600_000) }, homeTeamId: { not: '' }, awayTeamId: { not: '' } },
     select: { id: true },
   });
   let sent = 0;

@@ -22,7 +22,7 @@ import { matchesThisMonth, refundMatchPasses } from '~/services/billing';
 import { allows, featureAccess, setFeatureAccess } from '~/services/access';
 import { DECISION_KINDS, decisionEffect, decisionHasWinner, decisionSharesPoints, decisionText, decisionsFor, normaliseIdentifier, ageOn } from '@/engine';
 import { copyBirthDateToPlayers } from '~/routes/auth';
-import { getMatch, saveMatch } from '~/services/matches';
+import { forgetMatch, getMatch, saveMatch } from '~/services/matches';
 
 const isOwner = (u: User, orgId: string) => u.memberships.some((m) => m.orgId === orgId && m.role === 'owner');
 
@@ -249,6 +249,8 @@ export async function adminRoutes(app: FastifyInstance) {
     }
     if (b.venue) m.venue = b.venue;
     await saveMatch(m);
+    // A draft is the organiser's to shape: nobody is told until it's published.
+    if (m.draft) return m;
     const admins = await prisma.membership.findMany({ where: { clubId: { in: [m.homeTeamId, m.awayTeamId] }, role: 'clubAdmin' }, select: { userId: true } });
     const names = swapped ? await prisma.team.findMany({ where: { id: { in: [m.homeTeamId, m.awayTeamId] } }, select: { id: true, name: true } }) : [];
     const nameOf = (id: string) => names.find((t) => t.id === id)?.name ?? '';
@@ -262,6 +264,17 @@ export async function adminRoutes(app: FastifyInstance) {
   });
   // Every way a match ends without being played out (engine/decisions): postponed, cancelled, no result,
   // abandoned, walkover, neither side turning up, conceded, or awarded by the league.
+  // Removing one draft fixture (a published one is postponed or cancelled instead).
+  app.delete<{ Params: { id: string } }>('/matches/:id', async (req) => {
+    const user = requireUser(req);
+    const m = await getMatch(req.params.id);
+    if (!m.competitionId || !(await canRun(user, m))) throw forbidden('Only a league admin can remove fixtures');
+    if (!m.draft) throw conflict('Only draft fixtures can be removed. Postpone or cancel a published one');
+    await prisma.match.delete({ where: { id: m.id } });
+    forgetMatch(m.id);
+    return { ok: true as const };
+  });
+
   app.post<{ Params: { id: string } }>('/matches/:id/outcome', async (req) => {
     const user = requireUser(req);
     const b = z

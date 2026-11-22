@@ -170,15 +170,29 @@ export async function eligibilityFor(matchId: string): Promise<MatchEligibility>
 
 export async function matchRoutes(app: FastifyInstance) {
   app.get('/matches', async (req) => {
-    const q = z.object({ status: z.string().optional(), competitionId: z.string().optional(), teamId: z.string().optional() }).parse(req.query);
+    const q = z.object({ status: z.string().optional(), competitionId: z.string().optional(), teamId: z.string().optional(), drafts: z.enum(['1']).optional() }).parse(req.query);
+    // Draft fixtures are for the league's admins only, and only when they ask for them.
+    let drafts = false;
+    if (q.drafts && q.competitionId && req.user) {
+      const c = await prisma.competition.findUnique({ where: { id: q.competitionId }, select: { orgId: true } });
+      drafts = !!c && isLeagueAdmin(req.user, c.orgId);
+    }
     const rows = await prisma.match.findMany({
-      where: { ...(q.status ? { status: { in: q.status.split(',') } } : {}), ...(q.competitionId ? { competitionId: q.competitionId } : {}), ...(q.teamId ? { OR: [{ homeTeamId: q.teamId }, { awayTeamId: q.teamId }] } : {}) },
+      where: { ...(drafts ? {} : { draft: false }), ...(q.status ? { status: { in: q.status.split(',') } } : {}), ...(q.competitionId ? { competitionId: q.competitionId } : {}), ...(q.teamId ? { OR: [{ homeTeamId: q.teamId }, { awayTeamId: q.teamId }] } : {}) },
       orderBy: { startsAt: 'asc' },
     });
     return rows.map(toMatch);
   });
 
-  app.get<{ Params: { id: string } }>('/matches/:id', async (req) => getMatchCached(req.params.id));
+  app.get<{ Params: { id: string } }>('/matches/:id', async (req) => {
+    const m = await getMatchCached(req.params.id);
+    // A draft fixture doesn't exist yet for anyone but the league's admins.
+    if (m.draft) {
+      const c = m.competitionId ? await prisma.competition.findUnique({ where: { id: m.competitionId }, select: { orgId: true } }) : null;
+      if (!c || !isLeagueAdmin(req.user, c.orgId)) throw notFound('Match');
+    }
+    return m;
+  });
 
   app.post('/matches', async (req) => {
     const user = requireUser(req);

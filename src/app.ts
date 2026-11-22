@@ -14,7 +14,7 @@ import { startBus } from './lib/bus';
 import { endFeeds } from './lib/live';
 import { clearAllCaches } from './lib/cache';
 import { cacheStats, responseCache } from './lib/responseCache';
-import { forgetMatch } from './services/matches';
+import { forgetMatch, getMatchCached } from './services/matches';
 import { ApiError, plainIssue } from './lib/errors';
 import { prisma } from './db/client';
 import { storageRoot } from './lib/storage';
@@ -118,7 +118,19 @@ export async function buildApp() {
   // Shared answers for public reads. Registered before compression so it stores plain JSON.
   // A change made through a match's address (taking over scoring, a decision, a stoppage) may not go
   // through saveMatch, so the held copy of that match is dropped too. Balls keep it current themselves.
-  await responseCache(app, { onWrite: (url) => { const id = /\/matches\/([^/?]+)/.exec(url)?.[1]; if (id && !/\/balls(\/|$|\?)/.test(url)) forgetMatch(id); } });
+  await responseCache(app, {
+    onWrite: (url) => { const id = /\/matches\/([^/?]+)/.exec(url)?.[1]; if (id && !/\/balls(\/|$|\?)/.test(url)) forgetMatch(id); },
+    // Draft fixtures are only for the league's admins: never from (or into) the shared cache.
+    bypass: async (req) => {
+      const route = req.routeOptions.url ?? '';
+      if (route === '/api/v1/matches') return (req.query as { drafts?: string }).drafts === '1';
+      if (route.startsWith('/api/v1/matches/:id')) {
+        const id = (req.params as { id?: string }).id;
+        return !!id && !!(await getMatchCached(id).then((m) => m.draft).catch(() => false));
+      }
+      return false;
+    },
+  });
   // Smaller responses for everything else: a full scorecard is a fifth of the size gzipped.
   await app.register(compress, { global: true, threshold: 1024, encodings: ['gzip', 'deflate'] });
 

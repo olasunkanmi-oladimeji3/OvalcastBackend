@@ -134,11 +134,14 @@ on('responses:match', (id) => {
   for (const k of [...inflight.keys()]) if (forMatch(id as string)(k)) inflight.delete(k);
 });
 
-export async function responseCache(app: FastifyInstance, opts: { onWrite?: (url: string) => void } = {}) {
+export async function responseCache(app: FastifyInstance, opts: { onWrite?: (url: string) => void; bypass?: (req: FastifyRequest) => boolean | Promise<boolean> } = {}) {
   app.addHook('preHandler', async (req, reply) => {
     if (req.method !== 'GET') return;
     const rule = RULES[req.routeOptions.url ?? ''];
     if (!rule) return;
+    // Answers that differ by who asks in ways the rule doesn't know (a league admin's draft fixtures)
+    // are never shared, not even while loading.
+    if (opts.bypass && (await opts.bypass(req))) return;
     const key = rule.byUser && req.user ? `${req.user.id}|${req.url}` : req.url;
     const hit = store.get(key) ?? (await inflight.get(key));
     if (hit) return sendHit(req, reply, hit, rule);

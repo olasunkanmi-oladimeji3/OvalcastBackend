@@ -496,6 +496,8 @@ export interface Match {
   practice?: boolean;
   /** Confirmed by the organiser after the match; the app only suggests one. */
   playerOfMatchId?: ID;
+  /** A league fixture not published yet: only the league's admins see it, and can change it freely. */
+  draft?: boolean;
   /** Why a match ended without a result. */
   outcomeNote?: string;
   /** Overs cut by rain, bad light or a late start, and the chase's revised target. */
@@ -1512,7 +1514,8 @@ export interface OvalcastApi {
   countStreamView(streamId: ID): Promise<{ ok: true }>;
 
   // GET /matches?status=&competitionId=&teamId=
-  listMatches(params?: { status?: MatchStatus[]; competitionId?: ID; teamId?: ID }): Promise<Match[]>;
+  /** `drafts`: a league admin also gets the league's unpublished fixtures. */
+  listMatches(params?: { status?: MatchStatus[]; competitionId?: ID; teamId?: ID; drafts?: boolean }): Promise<Match[]>;
   // GET /matches/:id
   getMatch(id: ID): Promise<Match>;
   // POST /matches/:id/start   (assigned scorer only)
@@ -1779,6 +1782,10 @@ export interface OvalcastApi {
   // Fixtures. PATCH /matches/:id (league admin) , POST /matches/:id/outcome , POST /matches/:id/fixture-requests (club admin) , GET /competitions/:id/fixture-requests , POST /fixture-requests/:id/respond
   /** `swapSides`: the league makes the away side the home side (before the toss). */
   updateFixture(matchId: ID, patch: { startsAt?: ISODate; venue?: string; swapSides?: boolean }): Promise<Match>;
+  /** Draft fixtures: publish them all, remove one, or throw the draft away and reopen entries. */
+  publishFixtures(competitionId: ID): Promise<{ published: number }>;
+  removeDraftFixture(matchId: ID): Promise<{ ok: true }>;
+  discardDraftFixtures(competitionId: ID): Promise<{ discarded: number }>;
   setMatchOutcome(matchId: ID, input: MatchDecisionInput): Promise<Match>;
   requestFixtureChange(matchId: ID, input: { teamId: ID; startsAt?: ISODate; venue?: string; note: string }): Promise<FixtureRequest>;
   listFixtureRequests(competitionId: ID): Promise<FixtureRequest[]>;
