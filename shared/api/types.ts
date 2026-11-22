@@ -1107,6 +1107,30 @@ export interface MyPayoutAccount {
   holdUntil?: ISODate;
 }
 
+/** The leagues people watch most in each region (the region the league is in), and the streamers they watch most. Views only. */
+export interface MostWatched {
+  days: number;
+  regions: {
+    id: string;
+    name: string;
+    country: string;
+    views: number;
+    leagues: { competitionId: ID; name: string; season: string; orgId: ID; orgName: string; logoUrl?: string; views: number; streams: number }[];
+  }[];
+  streamers: { userId: ID; name: string; city?: string; views: number; streams: number }[];
+}
+
+/** Staff: Most watched with watch time, passes and what viewers paid, and where audiences come from. */
+export interface StaffAudience {
+  days: number;
+  /** When viewers' regions started being recorded; views before then have no viewer region. */
+  recordedSince?: ISODate;
+  regions: (Omit<MostWatched['regions'][number], 'leagues'> & { leagues: (MostWatched['regions'][number]['leagues'][number] & { liveMinutes: number; passes: number; paid: { currency: string; amount: number }[] })[] })[];
+  streamers: (MostWatched['streamers'][number] & { liveMinutes: number; passes: number; paid: { currency: string; amount: number }[] })[];
+  /** By the viewer's own region: how many views, and the leagues they watched most. */
+  viewerRegions: { id: string; name: string; views: number; leagues: { competitionId: ID; name: string; views: number }[] }[];
+}
+
 /** Ovalcast's own account, for staff. Each currency separate; amounts in the currency's main unit (naira, dollars). */
 export interface OvalcastAccount {
   days: number;
@@ -1708,6 +1732,9 @@ export interface OvalcastApi {
   markPayoutPaid(kind: 'host' | 'league', id: ID, note: string): Promise<{ ok: true }>;
   /** Staff: Ovalcast's own account, and recording money moved to Ovalcast's bank. */
   getOvalcastAccount(days: number): Promise<OvalcastAccount>;
+  // GET /insights/most-watched (public) , GET /staff/audience (staff)
+  getMostWatched(days: number): Promise<MostWatched>;
+  getStaffAudience(days: number): Promise<StaffAudience>;
   recordOvalcastSettlement(input: { amount: number; currency: string; reference: string; note?: string }): Promise<{ ok: true; id: ID }>;
 
   // GET /community?regionId= , POST /community

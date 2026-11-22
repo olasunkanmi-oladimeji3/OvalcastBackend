@@ -18,6 +18,7 @@ import { isClubAdmin, isLeagueAdmin, notify, toCompetition, toMatch, toOrg } fro
 import { open as openSecret, seal } from '~/lib/secrets';
 import { addRestream, closeLiveInput, createLiveInput, videoConfigured } from '~/lib/video';
 import { storage } from '~/lib/storage';
+import { recordStreamView } from '~/lib/audience';
 import { requireFeature } from '~/services/billing';
 import { forgetDevice, getMatch, saveMatch } from '~/services/matches';
 import { emitPartnerEvent } from '~/services/partners';
@@ -242,8 +243,11 @@ export async function featureRoutes(app: FastifyInstance) {
   // Someone opened the stream (live or replay): counted for the league's season report. No sign-in;
   // a counter only, so a repeat open just counts again.
   app.post<{ Params: { id: string } }>('/streams/:id/view', async (req) => {
-    const r = await prisma.stream.updateMany({ where: { id: req.params.id }, data: { views: { increment: 1 } } });
-    if (!r.count) throw notFound('Stream');
+    const s = await prisma.stream.findUnique({ where: { id: req.params.id }, select: { id: true, matchId: true, match: { select: { competitionId: true } } } });
+    if (!s) throw notFound('Stream');
+    await prisma.stream.update({ where: { id: s.id }, data: { views: { increment: 1 } } });
+    // Where the audience comes from, for the Most watched lists; never fails the count.
+    await recordStreamView(req, { id: s.id, matchId: s.matchId, competitionId: s.match.competitionId }).catch((e) => req.log.warn(e, 'stream view not recorded'));
     return { ok: true as const };
   });
 

@@ -1266,3 +1266,21 @@ model OvalcastSettlement {
   @@index([currency, at])
   @@map("ovalcast_settlements")
 }
+
+/// One person opening a stream, for where audiences come from. No IP is kept: `viewer` is a hash of
+/// the account, device or address, only to count a repeat open within a few hours once.
+model StreamView {
+  id            String   @id
+  at            DateTime @default(now()) @db.Timestamptz
+  streamId      String   @map("stream_id")
+  matchId       String   @map("match_id")
+  competitionId String?  @map("competition_id")
+  viewer        String
+  /// The viewer's country and region, from their profile; null when signed out or not set.
+  country       String?
+  regionId      String?  @map("region_id")
+
+  @@index([at])
+  @@index([streamId, viewer, at])
+  @@map("stream_views")
+}

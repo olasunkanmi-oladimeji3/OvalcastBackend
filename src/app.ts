@@ -24,6 +24,7 @@ import { marketRoutes } from './routes/market';
 import { orgPlanRoutes } from './routes/orgPlan';
 import { payoutRoutes } from './routes/payouts';
 import { ovalcastAccountRoutes } from './routes/ovalcastAccount';
+import { audienceRoutes } from './routes/audience';
 import { financeRoutes, webhookRoutes } from './routes/finance';
 import { billingRoutes } from './routes/billing';
 import { featureRoutes } from './routes/features';
@@ -174,6 +175,7 @@ export async function buildApp() {
       await api.register(orgPlanRoutes);
       await api.register(payoutRoutes);
       await api.register(ovalcastAccountRoutes);
+      await api.register(audienceRoutes);
       await api.register(matchRoutes);
       await api.register(peopleRoutes);
       await api.register(financeRoutes);

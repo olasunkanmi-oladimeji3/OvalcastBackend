@@ -51,6 +51,7 @@ const RULES: Record<string, Rule> = {
   [`${P}/officials`]: { ttl: 30 },
   [`${P}/people/:id`]: { ttl: 30, byUser: true },
   [`${P}/search`]: { ttl: 30 },
+  [`${P}/insights/most-watched`]: { ttl: 300 },
   [`${P}/community`]: { ttl: 5 },
   [`${P}/streams`]: { ttl: 5, byUser: true },
   [`${P}/streams/:id`]: { ttl: 5, byUser: true },
