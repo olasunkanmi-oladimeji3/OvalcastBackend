@@ -54,8 +54,8 @@ export interface PaymentsProvider {
    * Sends money out: a league's manual withdrawal or a host's weekly payout. `manual` means it
    * couldn't be sent automatically (no full account number on file) and staff must pay it.
    */
-  transfer(input: { amount: number; currency: string; institutionCode: string; accountRef: string; accountNumber?: string; narration: string; reference: string }): Promise<{ reference: string; manual?: boolean }>;
-  /** Where a transfer is, by Flutterwave's transfer id (from its webhook): never trust the webhook body alone. */
+  transfer(input: { amount: number; currency: string; institutionCode: string; accountRef: string; accountNumber?: string; narration: string; reference: string }): Promise<{ reference: string; id?: string; manual?: boolean }>;
+  /** Where a transfer is, by Flutterwave's transfer id (from its webhook, or saved when it was sent): never trust the webhook body alone. */
   transferStatus(id: string): Promise<{ reference: string; status: 'successful' | 'failed' | 'pending' }>;
   /** Gives a card or transfer payment back to whoever paid, by Flutterwave's transaction id. */
   refund(input: { transactionId: string; amount: number }): Promise<{ status: string }>;
@@ -69,12 +69,12 @@ export const devFlutterwave: PaymentsProvider = {
     if (!PAYOUT_INSTITUTIONS[country]?.some((i) => i.code === institutionCode)) throw badRequest('Pick the bank or network');
     // Numbers ending 0000 are "not found", to exercise the error path.
     if (accountNumber.endsWith('0000')) throw new ApiError(404, 'No account with that number. Check it with the bank.');
-    return { accountName: 'CRICKET CLUB OF LAGOS' };
+    return { accountName: 'TEST ACCOUNT HOLDER' };
   },
   createSubaccount: async ({ accountNumber }) => ({ subaccountId: `RS_dev${accountNumber.slice(-4)}${Date.now().toString(36)}` }),
   checkout: async ({ txRef }) => ({ link: `https://checkout.flutterwave.com/dev/${txRef}` }),
   verify: async (id) => ({ id, txRef: '', status: 'successful', amount: 0, currency: 'NGN', paymentType: 'card', paidAt: new Date().toISOString() }),
-  transfer: async ({ reference }) => ({ reference }),
+  transfer: async ({ reference }) => ({ reference, id: `dev_${reference}` }),
   transferStatus: async (id) => ({ reference: id, status: 'successful' }),
   refund: async () => ({ status: 'completed' }),
 };
@@ -108,7 +108,9 @@ export const liveFlutterwave: PaymentsProvider = {
     // Banks from Flutterwave; mobile money networks from our list, which Flutterwave's bank list doesn't include.
     const banks = await flw<{ code: string; name: string }[]>('GET', `/banks/${code}`).catch(() => []);
     const networks = (PAYOUT_INSTITUTIONS[countryInfo(country).name] ?? []).filter((i) => i.kind === 'mobileMoney');
-    return [...networks, ...banks.map((b) => ({ code: b.code, name: b.name, kind: 'bank' as const }))];
+    // Flutterwave's list comes in no order; A to Z, so people find their bank among hundreds.
+    const sorted = banks.map((b) => ({ code: b.code, name: b.name.trim(), kind: 'bank' as const })).sort((x, y) => x.name.localeCompare(y.name, 'en', { sensitivity: 'base' }));
+    return [...networks, ...sorted];
   },
   async resolve({ country, kind, institutionCode, accountNumber }) {
     const problem = accountNumberProblem(country, kind, accountNumber);
@@ -153,8 +155,8 @@ export const liveFlutterwave: PaymentsProvider = {
     // Without the full account number (Ovalcast keeps only the last four digits), staff pay it by hand
     // from the backoffice; it's recorded as waiting rather than paid.
     if (!accountNumber) return { reference, manual: true };
-    const r = await flw<{ reference: string }>('POST', '/transfers', { account_bank: institutionCode, account_number: accountNumber, amount, currency, narration, reference, debit_currency: currency });
-    return { reference: r.reference ?? reference };
+    const r = await flw<{ id?: number | string; reference: string }>('POST', '/transfers', { account_bank: institutionCode, account_number: accountNumber, amount, currency, narration, reference, debit_currency: currency });
+    return { reference: r.reference ?? reference, ...(r.id != null ? { id: String(r.id) } : {}) };
   },
   async transferStatus(id) {
     const d = await flw<{ reference: string; status: string }>('GET', `/transfers/${encodeURIComponent(id)}`);

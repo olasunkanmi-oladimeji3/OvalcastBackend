@@ -4,6 +4,7 @@ import { availableParallelism } from 'node:os';
 import { buildApp } from './app';
 import { startDemoSimulator } from './services/demo';
 import { startWebhookWorker } from './services/partners';
+import { grantStaff } from './lib/staffAccess';
 import { startJobs } from './services/jobs';
 import { warmStats } from './services/stats';
 import { checkConfig } from './lib/config';
@@ -47,6 +48,9 @@ if (cluster.isPrimary && workers > 1) {
   if (wanted > 1 && workers === 1) app.log.warn('WEB_CONCURRENCY needs REDIS_URL to keep processes in step: running one process');
   const port = Number(process.env.PORT ?? 4000);
   await app.listen({ port, host: '0.0.0.0' });
+  // Backoffice access: accounts listed in STAFF_EMAILS become staff at start-up. Only ever grants;
+  // taking it away is done in the backoffice, so removing a name here changes nothing.
+  void grantStaff(process.env.STAFF_EMAILS).then((n) => n && app.log.info(`STAFF_EMAILS: ${n} account(s) given backoffice access`)).catch((e) => app.log.warn(e, 'STAFF_EMAILS failed'));
   // Player stats are built once at start-up, then kept up to date in the background.
   void warmStats().catch((e) => app.log.warn(e, 'Stats warm-up failed; they build on first use'));
   // Background work runs in one process only, and not at all when a separate worker does it

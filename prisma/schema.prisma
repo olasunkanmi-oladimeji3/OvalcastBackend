@@ -692,6 +692,8 @@ model Settlement {
   kind         String
   createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz
   paidAt       DateTime?    @map("paid_at") @db.Timestamptz
+  /// Flutterwave's id for the transfer, to ask it whether the money arrived.
+  providerId   String?      @map("provider_id")
   org          Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   @@index([orgId, createdAt])
@@ -880,6 +882,8 @@ model HostPayout {
   paidAt    DateTime? @map("paid_at") @db.Timestamptz
   /// Staff's note when they marked it paid by hand (the bank's reference).
   note      String?
+  /// Flutterwave's id for the transfer, to ask it whether the money arrived.
+  providerId String? @map("provider_id")
 
   @@index([userId, at])
   @@index([at])
@@ -1244,4 +1248,21 @@ model MoneyLog {
   @@index([userId, at])
   @@index([orgId, at])
   @@map("money_logs")
+}
+
+/// Money Ovalcast moved from its Flutterwave balance to its own bank: recorded by staff with the
+/// reference, so what Ovalcast earned, what reached its bank and what is still with Flutterwave add up.
+model OvalcastSettlement {
+  id        String   @id
+  at        DateTime @default(now()) @db.Timestamptz
+  amount    Int
+  currency  String
+  /// The bank's or Flutterwave's reference for the payout.
+  reference String
+  note      String?
+  staffId   String   @map("staff_id")
+  staffName String   @map("staff_name")
+
+  @@index([currency, at])
+  @@map("ovalcast_settlements")
 }

@@ -3,7 +3,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import type { Match, OfficiatingProfile, OfficialRole, PersonProfile, RatingSummary, StaffMember, User } from '@/api/types';
+import type { Match, MatchOfficialRating, OfficiatingProfile, OfficialRole, PersonProfile, RatingSummary, StaffMember, User } from '@/api/types';
 import { RATED_LABEL, RATING_ASPECTS, ratingAverage, ratingProblem } from '@/engine';
 import type * as P from '~/generated/prisma/client';
 import { json, Prisma, prisma, toJson } from '~/db/client';
@@ -13,6 +13,7 @@ import { newId } from '~/lib/ids';
 import { isClubAdmin, isLeagueAdmin, loadUser, matchIdsWithOfficial, notify, toMatch } from '~/lib/repo';
 import { storage } from '~/lib/storage';
 import { aggregate, replayedMatches } from '~/services/stats';
+import { getMatch } from '~/services/matches';
 
 const ROLES = ['scorer', 'umpire', 'groundsman', 'coach'] as const;
 const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const;
@@ -35,6 +36,32 @@ async function bookedOn(date: string) {
     for (const id of [o.scorerUserId, ...(o.umpireUserIds ?? []), ...(o.groundsmanUserIds ?? [])]) if (id) ids.add(id);
   }
   return ids;
+}
+
+/** Part of the match: ran it, runs either club, played in it, or officiated it. */
+function partOfMatch(viewer: User, m: Match, orgId?: string) {
+  const xi = Object.values(m.playingXI ?? {}).flat();
+  const o = m.officials;
+  return (
+    (!!orgId && isLeagueAdmin(viewer, orgId)) ||
+    isClubAdmin(viewer, m.homeTeamId) ||
+    isClubAdmin(viewer, m.awayTeamId) ||
+    m.createdBy === viewer.id ||
+    (!!viewer.playerId && xi.includes(viewer.playerId)) ||
+    o.scorerUserId === viewer.id ||
+    !!o.umpireUserIds?.includes(viewer.id) ||
+    !!o.groundsmanUserIds?.includes(viewer.id)
+  );
+}
+
+/** Who officiated a match, by role: only people with an Ovalcast account can be rated. */
+function officialsOf(m: Match): { userId: string; role: 'scorer' | 'umpire' | 'groundsman'; name: string }[] {
+  const o = m.officials;
+  return [
+    ...(o.scorerUserId ? [{ userId: o.scorerUserId, role: 'scorer' as const, name: o.scorerName ?? 'Scorer' }] : []),
+    ...(o.umpireUserIds ?? []).map((id, i) => ({ userId: id, role: 'umpire' as const, name: o.umpires[i] ?? 'Umpire' })),
+    ...(o.groundsmanUserIds ?? []).map((id, i) => ({ userId: id, role: 'groundsman' as const, name: o.groundsmen?.[i] ?? 'Groundsman' })),
+  ].filter((x) => !!x.userId);
 }
 
 /** "LEK v APA, 14 Oct", for rating lists. */
@@ -81,22 +108,7 @@ async function rateableBy(u: P.User, viewer: User | undefined, paths: Partial<Re
   const done = (role: string, matchId?: string) => mine.some((r) => r.role === role && (r.matchId ?? undefined) === matchId);
   const all = Object.values(paths).flat();
   const orgOf = new Map((await prisma.competition.findMany({ where: { id: { in: all.map((m) => m.competitionId!).filter(Boolean) } }, select: { id: true, orgId: true } })).map((c) => [c.id, c.orgId]));
-  // Part of the match: ran it, runs either club, played in it, or officiated it.
-  const involved = (m: Match) => {
-    const orgId = m.competitionId ? orgOf.get(m.competitionId) : undefined;
-    const xi = Object.values(m.playingXI ?? {}).flat();
-    const o = m.officials;
-    return (
-      (!!orgId && isLeagueAdmin(viewer, orgId)) ||
-      isClubAdmin(viewer, m.homeTeamId) ||
-      isClubAdmin(viewer, m.awayTeamId) ||
-      m.createdBy === viewer.id ||
-      (!!viewer.playerId && xi.includes(viewer.playerId)) ||
-      o.scorerUserId === viewer.id ||
-      !!o.umpireUserIds?.includes(viewer.id) ||
-      !!o.groundsmanUserIds?.includes(viewer.id)
-    );
-  };
+  const involved = (m: Match) => partOfMatch(viewer, m, m.competitionId ? orgOf.get(m.competitionId) : undefined);
   const finished = (ms: Match[] = []) => ms.filter((m) => m.status === 'completed' && involved(m));
   const labels = await matchLabels(all);
   const runsSomething = viewer.memberships.some((x) => x.role === 'owner' || x.role === 'leagueAdmin' || x.role === 'clubAdmin');
@@ -159,13 +171,53 @@ async function userRow(id: string) {
 export async function peopleRoutes(app: FastifyInstance) {
   app.get<{ Params: { id: string } }>('/people/:id', async (req) => person(await userRow(req.params.id), { withMatches: true, viewer: req.user }));
 
+  // A match's officials with their ratings: overall in that job, for this match, and whether you can rate them for it.
+  app.get<{ Params: { id: string } }>('/matches/:id/official-ratings', async (req): Promise<MatchOfficialRating[]> => {
+    const m = await getMatch(req.params.id);
+    const list = officialsOf(m);
+    if (!list.length) return [];
+    const rows = await prisma.rating.findMany({ where: { userId: { in: list.map((x) => x.userId) }, role: { in: ['scorer', 'umpire', 'groundsman'] } }, select: { userId: true, role: true, matchId: true, raterId: true, scores: true } });
+    const viewer = req.user;
+    const orgId = m.competitionId ? (await prisma.competition.findUnique({ where: { id: m.competitionId }, select: { orgId: true } }))?.orgId : undefined;
+    const mayRate = !!viewer && m.status === 'completed' && partOfMatch(viewer, m, orgId);
+    const summary = (rs: typeof rows) => {
+      if (!rs.length) return undefined;
+      const avg = rs.reduce((t, r) => t + ratingAverage(json<Record<string, number>>(r.scores)), 0) / rs.length;
+      return { average: Math.round(avg * 10) / 10, count: rs.length };
+    };
+    return list.map((o) => {
+      const theirs = rows.filter((r) => r.userId === o.userId && r.role === o.role);
+      const here = theirs.filter((r) => r.matchId === m.id);
+      const mine = here.find((r) => r.raterId === viewer?.id);
+      return {
+        userId: o.userId,
+        role: o.role,
+        name: o.name,
+        ...(summary(theirs) ? { overall: summary(theirs) } : {}),
+        ...(summary(here) ? { thisMatch: summary(here) } : {}),
+        ...(mine ? { mine: ratingAverage(json<Record<string, number>>(mine.scores)) } : {}),
+        canRate: mayRate && viewer!.id !== o.userId && !mine,
+      };
+    });
+  });
+
   // Rate an official's work: someone who was part of the match, once per match and role.
   app.post<{ Params: { id: string } }>('/people/:id/ratings', async (req) => {
     const user = requireUser(req);
     const b = z.object({ role: z.enum(RATED), matchId: z.string().optional(), scores: z.record(z.string(), z.number().int().min(1).max(5)), comment: z.string().trim().max(280).optional() }).parse(req.body);
     const u = await userRow(req.params.id);
-    const profile = await person(u, { withMatches: true, viewer: user });
-    if (!profile.rateable.some((r) => r.role === b.role && r.matchId === b.matchId)) throw forbidden(b.matchId ? 'Only people who were part of that match can rate it, once' : 'Only people who have worked with them, or club and league admins, can rate this, once');
+    if (u.id === user.id) throw forbidden('You can’t rate yourself');
+    if (b.matchId) {
+      // For one match: it's finished, they did that job in it, you were part of it, and you haven't rated it yet.
+      const m = await getMatch(b.matchId);
+      const orgId = m.competitionId ? (await prisma.competition.findUnique({ where: { id: m.competitionId }, select: { orgId: true } }))?.orgId : undefined;
+      const didIt = b.role === 'player' ? !!u.playerId && Object.values(m.playingXI ?? {}).flat().includes(u.playerId) : officialsOf(m).some((o) => o.userId === u.id && o.role === b.role);
+      const already = await prisma.rating.count({ where: { userId: u.id, raterId: user.id, role: b.role, matchId: m.id } });
+      if (m.status !== 'completed' || !didIt || !partOfMatch(user, m, orgId) || already) throw forbidden('Only people who were part of that match can rate it, once, after it ends');
+    } else {
+      const profile = await person(u, { withMatches: true, viewer: user });
+      if (!profile.rateable.some((r) => r.role === b.role && !r.matchId)) throw forbidden('Only people who have worked with them, or club and league admins, can rate this, once');
+    }
     const problem = ratingProblem(b.role, b.scores);
     if (problem) throw badRequest(problem);
     await prisma.rating.create({ data: { id: newId('rate'), userId: u.id, raterId: user.id, raterName: user.name, role: b.role, matchId: b.matchId ?? null, scores: toJson(b.scores), comment: b.comment || null } });

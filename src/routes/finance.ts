@@ -96,7 +96,7 @@ export async function financeRoutes(app: FastifyInstance) {
     const b = z.object({ kind: z.enum(['bank', 'mobileMoney']), institutionCode: z.string(), accountNumber: z.string().transform((v) => v.replace(/\D/g, '')).optional(), schedule: z.enum(['auto', 'weekly', 'manual']), password: z.string().min(1, 'Enter your password').max(200) }).parse(req.body);
     if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only a league admin can change where the league is paid');
     const row = await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { passwordHash: true } });
-    if (!(await verifyPassword(row.passwordHash, b.password))) throw new ApiError(401, 'That password is not right');
+    if (!(await verifyPassword(row.passwordHash, b.password))) throw new ApiError(403, 'That password is not right');
     const org = await orgOr404(req.params.id);
     const previous = org.payoutAccount;
     await requireFeature(org.id, 'entryFeeCollection', 'Collecting entry fees online');
@@ -139,7 +139,7 @@ export async function financeRoutes(app: FastifyInstance) {
     // The admin's password, every time: league money only leaves with it.
     const { password } = z.object({ password: z.string().min(1, 'Enter your password').max(200) }).parse(req.body ?? {});
     const row = await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { passwordHash: true } });
-    if (!(await verifyPassword(row.passwordHash, password))) throw new ApiError(401, 'That password is not right');
+    if (!(await verifyPassword(row.passwordHash, password))) throw new ApiError(403, 'That password is not right');
     // One withdrawal per league at a time: a second one waits, then finds nothing left to send.
     return oneAtATime(`withdraw:${req.params.id}`, () => withdraw(req, req.params.id, user));
   });
@@ -166,7 +166,8 @@ export async function financeRoutes(app: FastifyInstance) {
     await logMoney(req, { userId: user.id, orgId: org.id, action: 'withdrawal', amount, currency, reference, detail: st.accountLabel });
     // Recorded first, then sent: a crash in between can never send it twice.
     try {
-      await payments().transfer({ amount, currency, institutionCode: account.institutionCode, accountRef: account.subaccountCode, accountNumber: openSecret(account.accountNumberEnc), narration: `${org.shortName} entry fees`, reference });
+      const sent = await payments().transfer({ amount, currency, institutionCode: account.institutionCode, accountRef: account.subaccountCode, accountNumber: openSecret(account.accountNumberEnc), narration: `${org.shortName} entry fees`, reference });
+      if (sent.id) await prisma.settlement.update({ where: { id: st.id }, data: { providerId: sent.id } });
     } catch (e) {
       if ((e as { status?: number }).status === 400) {
         await settleTransfer(reference, 'failed');

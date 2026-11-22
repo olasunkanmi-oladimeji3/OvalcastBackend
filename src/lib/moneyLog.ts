@@ -4,7 +4,7 @@ import type { FastifyRequest } from 'fastify';
 import { prisma } from '~/db/client';
 import { newId } from './ids';
 
-export async function logMoney(req: FastifyRequest, entry: { userId: string; orgId?: string; action: 'withdrawal' | 'payoutAccount' | 'markedPaid'; amount?: number; currency?: string; reference?: string; detail?: string }) {
+export async function logMoney(req: FastifyRequest, entry: { userId: string; orgId?: string; action: 'withdrawal' | 'payoutAccount' | 'markedPaid' | 'ovalcastSettlement'; amount?: number; currency?: string; reference?: string; detail?: string }) {
   const header = (name: string) => {
     const v = req.headers[name];
     return (Array.isArray(v) ? v[0] : v)?.slice(0, 200);

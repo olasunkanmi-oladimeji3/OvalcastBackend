@@ -3,6 +3,7 @@
 //
 //   npm run jobs   (once, by hand)
 
+import { confirmTransfers } from '~/routes/payouts';
 import { sendMatchReminders } from './matchNews';
 import type { FastifyBaseLogger } from 'fastify';
 
@@ -141,5 +142,8 @@ export function startJobs(log: JobLog, everyMs = 3600_000) {
   // Match reminders need finer timing (two hours before), so they run every five minutes.
   const r = setInterval(() => void withLock('ovalcast:reminders', () => sendMatchReminders()).catch((e) => log.error(e)), 5 * 60_000);
   r.unref();
-  return () => (clearInterval(t), clearInterval(r));
+  // Withdrawals on their way: confirmed with Flutterwave even if its webhook never comes.
+  const w = setInterval(() => void withLock('ovalcast:transfers', () => confirmTransfers()).then((x) => x?.checked && log.info(x, 'transfers confirmed')).catch((e) => log.error(e)), 5 * 60_000);
+  w.unref();
+  return () => (clearInterval(t), clearInterval(r), clearInterval(w));
 }

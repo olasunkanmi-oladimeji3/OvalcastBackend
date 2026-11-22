@@ -713,6 +713,19 @@ export interface RatingSummary {
   overall: number;
 }
 
+/** One official at a match, with how they're rated in that job: overall, for this match, and whether you can rate them for it. */
+export interface MatchOfficialRating {
+  userId: ID;
+  role: 'scorer' | 'umpire' | 'groundsman';
+  name: string;
+  overall?: { average: number; count: number };
+  thisMatch?: { average: number; count: number };
+  /** Your own rating for this match, if you gave one. */
+  mine?: number;
+  /** The match is over, you were part of it, it isn't you, and you haven't rated them for it. */
+  canRate: boolean;
+}
+
 export interface RatingInput {
   role: import('@/engine').RatedRole;
   matchId?: ID;
@@ -1092,6 +1105,27 @@ export interface MyPayoutAccount {
   verifiedAt: ISODate;
   /** Withdrawals pause until then, 24 hours after the account changed. */
   holdUntil?: ISODate;
+}
+
+/** Ovalcast's own account, for staff. Each currency separate; amounts in the currency's main unit (naira, dollars). */
+export interface OvalcastAccount {
+  days: number;
+  currencies: {
+    currency: string;
+    /** What Ovalcast earned, by where it came from: in the chosen period, and ever. */
+    period: { streams: number; leagueFees: number; plans: number; viewerCredits: number; total: number };
+    allTime: { streams: number; leagueFees: number; plans: number; viewerCredits: number; total: number };
+    /** Moved to Ovalcast's bank, as recorded by staff. */
+    settled: number;
+    /** Earned but not yet recorded as moved to the bank: still in Ovalcast's Flutterwave balance. */
+    withFlutterwave: number;
+    /** Not Ovalcast's: streamers' balances waiting to be withdrawn, and money in fans' wallets. */
+    heldForStreamers: number;
+    heldInWallets: number;
+  }[];
+  /** Ovalcast's share of entry fees in the period, per league. */
+  leagues: { orgId: ID; name: string; currency: string; payments: number; collected: number; ovalcast: number }[];
+  settlements: { id: ID; at: ISODate; amount: number; currency: string; reference: string; note?: string; staffName: string }[];
 }
 
 /** A payout staff should look at: refused, unconfirmed after two days, or waiting to be paid by hand. */
@@ -1672,6 +1706,9 @@ export interface OvalcastApi {
   /** Staff: payouts needing attention, and recording one paid by hand. */
   listPayoutsNeedingAttention(): Promise<PayoutAttention[]>;
   markPayoutPaid(kind: 'host' | 'league', id: ID, note: string): Promise<{ ok: true }>;
+  /** Staff: Ovalcast's own account, and recording money moved to Ovalcast's bank. */
+  getOvalcastAccount(days: number): Promise<OvalcastAccount>;
+  recordOvalcastSettlement(input: { amount: number; currency: string; reference: string; note?: string }): Promise<{ ok: true; id: ID }>;
 
   // GET /community?regionId= , POST /community
   listPosts(regionId: ID): Promise<CommunityPost[]>;
@@ -1763,6 +1800,8 @@ export interface OvalcastApi {
   updateMyPlaying(input: PlayingStyle): Promise<User>;
   // POST /people/:id/ratings  (someone who worked a match with them; one rating per match and role)
   rateOfficial(userId: ID, input: RatingInput): Promise<PersonProfile>;
+  // GET /matches/:id/official-ratings
+  getMatchOfficialRatings(matchId: ID): Promise<MatchOfficialRating[]>;
   // GET /feature-access (public) , PUT /staff/feature-access (staff): which features need a paid plan. Everything is free at launch.
   getFeatureAccess(): Promise<import('@/engine').FeatureAccess>;
   // GET /organisations/:id/series: each tournament with its yearly editions and how they compare.

@@ -78,6 +78,31 @@ export async function settleTransfer(reference: string, status: 'successful' | '
   return 'unknown';
 }
 
+/**
+ * Asks Flutterwave about every withdrawal still on its way, so they're confirmed even when its
+ * webhook never arrives. Runs every five minutes; a transfer is given two minutes first, and after
+ * a week it's left to staff (it shows on their list after two days).
+ */
+export async function confirmTransfers(now = new Date()) {
+  const window = { gte: new Date(now.getTime() - 7 * 86_400_000), lte: new Date(now.getTime() - 2 * 60_000) };
+  const [hosts, leagues] = await Promise.all([
+    prisma.hostPayout.findMany({ where: { status: 'processing', providerId: { not: null }, at: window }, select: { reference: true, providerId: true }, take: 50 }),
+    prisma.settlement.findMany({ where: { status: 'processing', providerId: { not: null }, createdAt: window }, select: { reference: true, providerId: true }, take: 50 }),
+  ]);
+  const out = { checked: 0, paid: 0, failed: 0 };
+  for (const t of [...hosts, ...leagues]) {
+    out.checked++;
+    try {
+      const s = await payments().transferStatus(t.providerId!);
+      if (s.status === 'pending' || s.reference !== t.reference) continue;
+      if ((await settleTransfer(t.reference, s.status)) !== 'unchanged') out[s.status === 'successful' ? 'paid' : 'failed']++;
+    } catch {
+      // Flutterwave didn't answer: try again next time.
+    }
+  }
+  return out;
+}
+
 export async function payoutRoutes(app: FastifyInstance) {
   // ------------------------------------------------------------ your account
   app.get('/me/payout-account', async (req) => {
@@ -90,7 +115,7 @@ export async function payoutRoutes(app: FastifyInstance) {
     const user = requireUser(req);
     const b = z.object({ institutionCode: z.string().trim().min(1).max(20), accountNumber: z.string().transform((v) => v.replace(/\D/g, '')).pipe(z.string().min(6, 'Check the account number').max(20)), password: z.string().min(1, 'Enter your password').max(200) }).parse(req.body);
     const row = await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { passwordHash: true, country: true } });
-    if (!(await verifyPassword(row.passwordHash, b.password))) throw new ApiError(401, 'That password is not right');
+    if (!(await verifyPassword(row.passwordHash, b.password))) throw new ApiError(403, 'That password is not right');
     const country = row.country ?? 'Nigeria';
     const provider = payments();
     const inst = (await provider.institutions(country)).find((i) => i.code === b.institutionCode);
@@ -113,7 +138,7 @@ export async function payoutRoutes(app: FastifyInstance) {
     const user = requireUser(req);
     const { currency: wanted, password } = z.object({ currency: z.string().length(3).optional(), password: z.string().min(1, 'Enter your password').max(200) }).parse(req.body ?? {});
     const row = await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { passwordHash: true } });
-    if (!(await verifyPassword(row.passwordHash, password))) throw new ApiError(401, 'That password is not right');
+    if (!(await verifyPassword(row.passwordHash, password))) throw new ApiError(403, 'That password is not right');
     return oneAtATime(`host-withdraw:${user.id}`, async () => {
       const account = await prisma.userPayoutAccount.findUnique({ where: { userId: user.id } });
       if (!account) throw conflict('Add the account to be paid into first');
@@ -129,7 +154,8 @@ export async function payoutRoutes(app: FastifyInstance) {
       const payout = await prisma.hostPayout.create({ data: { id: newId('hp'), userId: user.id, amount, currency, status: 'processing', reference, accountLabel } });
       await logMoney(req, { userId: user.id, action: 'withdrawal', amount, currency, reference, detail: accountLabel });
       try {
-        await payments().transfer({ amount, currency, institutionCode: account.institutionCode, accountRef: user.id, accountNumber: openSecret(account.accountNumberEnc), narration: 'Ovalcast stream earnings', reference });
+        const sent = await payments().transfer({ amount, currency, institutionCode: account.institutionCode, accountRef: user.id, accountNumber: openSecret(account.accountNumberEnc), narration: 'Ovalcast stream earnings', reference });
+        if (sent.id) await prisma.hostPayout.update({ where: { id: payout.id }, data: { providerId: sent.id } });
       } catch (e) {
         // Flutterwave said no (a 4xx): nothing went, so the money stays in the balance.
         if ((e as { status?: number }).status === 400) {
@@ -171,6 +197,8 @@ export async function payoutRoutes(app: FastifyInstance) {
       const h = await prisma.hostPayout.findUnique({ where: { id: req.params.id } });
       if (!h) throw notFound('Payout');
       if (h.status === 'paid') throw conflict('Already paid');
+      // A refused transfer's money went back to their balance; paying it by hand would pay it twice.
+      if (h.status === 'failed') throw conflict('This one was turned down and the money went back to their balance. They can withdraw it again');
       await prisma.hostPayout.update({ where: { id: h.id }, data: { status: 'paid', paidAt: new Date(), note } });
       await notify(h.userId, { kind: 'payment', title: `${formatMoney(h.amount, (h.currency ?? 'NGN') as FinanceCurrency)} withdrawn`, body: `Paid to ${h.accountLabel ?? 'your account'}. Reference ${note}.`, link: { pathname: '/earnings' } });
       await logMoney(req, { userId: staff.id, action: 'markedPaid', amount: h.amount, currency: h.currency ?? undefined, reference: h.reference, detail: `host ${h.userId}: ${note}` });
@@ -178,6 +206,7 @@ export async function payoutRoutes(app: FastifyInstance) {
       const s = await prisma.settlement.findUnique({ where: { id: req.params.id } });
       if (!s) throw notFound('Withdrawal');
       if (s.status === 'paid') throw conflict('Already paid');
+      if (s.status === 'failed') throw conflict('This one was turned down and the money is waiting for the league to withdraw again');
       await prisma.settlement.update({ where: { id: s.id }, data: { status: 'paid', paidAt: new Date() } });
       await notify(await orgAdminIds(s.orgId), { kind: 'payment', title: `${formatMoney(s.amount, s.currency as FinanceCurrency)} league withdrawal paid`, body: `To ${s.accountLabel}. Reference ${note}.`, link: { pathname: '/money/[orgId]', params: { orgId: s.orgId } } });
       await logMoney(req, { userId: staff.id, orgId: s.orgId, action: 'markedPaid', amount: s.amount, currency: s.currency, reference: s.reference, detail: note });
