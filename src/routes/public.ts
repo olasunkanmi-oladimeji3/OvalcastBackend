@@ -1,12 +1,12 @@
 // Organisations, regions and regional leaders, search, community posts,
 // notifications, streams and clips.
 
-import { recordingOf, videoConfigured } from '~/lib/video';
+import { recordingsOf, videoConfigured } from '~/lib/video';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { LeaderRow, PostKind, RegionalLeaders } from '@/api/types';
 import type * as P from '~/generated/prisma/client';
-import { json, prisma } from '~/db/client';
+import { json, Prisma, prisma } from '~/db/client';
 import { requireUser } from '~/lib/auth';
 import { badRequest, notFound } from '~/lib/errors';
 import { newId } from '~/lib/ids';
@@ -133,15 +133,16 @@ export async function publicRoutes(app: FastifyInstance) {
   // Paid streams: the playback URL and clips go only to the host and pass holders. The score stays free.
   const guard = async (s: P.Stream, userId?: string) => {
     // Never the ingest key, its address or the live input: those are for whoever streams.
-    const { ingestKeyEnc: _k, ingestUrl: _u, liveInputId: _l, ...open } = s;
-    void _k; void _u; void _l;
-    return (await mayWatch(userId, s.matchId)) ? open : { ...open, playbackUrl: '' };
+    const { ingestKeyEnc: _k, ingestUrl: _u, liveInputId: _l, checkedAt: _c, downAlertedAt: _a, ...open } = s;
+    void _k; void _u; void _l; void _c; void _a;
+    return (await mayWatch(userId, s.matchId)) ? open : { ...open, playbackUrl: '', replayParts: null };
   };
   /** A finished stream plays its recording once the video service has it ready. */
   const withReplay = async (s: P.Stream) => {
     if (s.status !== 'ended' || !s.liveInputId || !videoConfigured() || !s.playbackUrl.includes(s.liveInputId)) return s;
-    const replay = await recordingOf(s.liveInputId).catch(() => undefined);
-    return replay ? prisma.stream.update({ where: { id: s.id }, data: { playbackUrl: replay } }) : s;
+    // One recording per connection: a stream that dropped and reconnected replays in parts, in order.
+    const parts = await recordingsOf(s.liveInputId).catch(() => [] as string[]);
+    return parts.length ? prisma.stream.update({ where: { id: s.id }, data: { playbackUrl: parts[0], replayParts: parts.length > 1 ? parts : Prisma.DbNull } }) : s;
   };
   app.get('/streams', async (req) => {
     const { status } = z.object({ status: z.enum(['live', 'ended', 'scheduled']).optional() }).parse(req.query);

@@ -9,7 +9,8 @@ import type { Competition } from '@/api/types';
 import { registrationCheck } from '@/engine';
 import { prisma } from '~/db/client';
 import { newId } from '~/lib/ids';
-import { notify, toCompetition, toRegistration } from '~/lib/repo';
+import { notify, orgAdminIds, toCompetition, toRegistration } from '~/lib/repo';
+import { seasonOf } from '~/lib/seasons';
 
 type Tx = Pick<typeof prisma, 'registration' | 'player' | 'user' | 'competition' | 'team'>;
 
@@ -55,16 +56,21 @@ export async function registerPlayers(c: Competition, teamId: string, playerIds:
   // The date of birth given at sign-up, for anyone whose player records don't have one.
   const accounts = await db.user.findMany({ where: { id: { in: [...new Set(person.values())] }, dateOfBirth: { not: null } }, select: { id: true, dateOfBirth: true } });
   for (const a of accounts) if (!born.has(a.id)) born.set(a.id, a.dateOfBirth!.toISOString().slice(0, 10));
+  // The league's season: second clubs across its leagues follow the season's QYP rules.
+  const season = await seasonOf(c.orgId, c.season);
   const teamIds = [...new Set([teamId, ...regs.map((r) => r.teamId)])];
   const names = new Map((await db.team.findMany({ where: { id: { in: teamIds } }, select: { id: true, name: true } })).map((t) => [t.id, t.name]));
 
   const held: Held[] = [];
   const rows = [];
+  const qypRequests: { playerId: string; mainTeamId: string; qypTeamId: string }[] = [];
   for (const playerId of [...new Set(playerIds)]) {
     const who = person.get(playerId) ?? playerId;
     // Already in this club's squad for this league (under any of their records): nothing to do.
     if (regs.some((r) => r.playerId === who && r.competitionId === c.id && r.teamId === teamId && r.status === 'active')) continue;
-    const verdict = registrationCheck({ playerId: who, teamId, league: c, leagues: comps, regs, teamName: (id) => names.get(id) ?? 'another club', playerBirthDate: born.get(who), leagueStartsOn: c.startsOn });
+    const verdict = registrationCheck({ playerId: who, teamId, league: c, leagues: comps, regs, teamName: (id) => names.get(id) ?? 'another club', playerBirthDate: born.get(who), leagueStartsOn: c.startsOn, season });
+    // A second club this season that qualifies as QYP waits for the organisation's approval.
+    if (!verdict.ok && verdict.qypRequest) qypRequests.push({ playerId: who, ...verdict.qypRequest });
     const since = new Date();
     const row = { id: newId('reg'), competitionId: c.id, playerId, teamId, primary: verdict.ok ? verdict.primary : false, since, status: 'active', approved: opts.approved ?? !c.playerRules.squadApproval, heldReason: verdict.ok ? null : verdict.reason, overrideNote: null, overrideBy: null };
     rows.push(row);
@@ -73,6 +79,7 @@ export async function registerPlayers(c: Competition, teamId: string, playerIds:
     if (!verdict.ok) held.push({ playerId, reason: verdict.reason, canChoose: verdict.canChoose });
   }
   if (rows.length) await db.registration.createMany({ data: rows });
+  if (qypRequests.length) await askForQyp(c, qypRequests);
   return held;
 }
 
@@ -87,5 +94,41 @@ export async function tellAboutHolds(c: Competition, teamId: string, held: Held[
   for (const u of users) {
     const h = held.find((x) => x.playerId === u.playerId)!;
     await notify([u.id], { kind: 'entry', title: h.canChoose ? `Choose your club in ${c.name}` : `You're held in ${c.name}`, body: h.canChoose ? `${h.reason}. Choose your main club (and a second club, where the league allows it).` : `${h.reason}. The league can release you.`, link });
+  }
+}
+
+/** QYP places waiting for the organisation: recorded once per player and season, and the admins told. */
+async function askForQyp(c: Competition, requests: { playerId: string; mainTeamId: string; qypTeamId: string }[]) {
+  let added = 0;
+  for (const r of requests) {
+    const existing = await prisma.seasonQyp.findUnique({ where: { orgId_season_playerId: { orgId: c.orgId, season: c.season, playerId: r.playerId } } });
+    if (existing) continue;
+    await prisma.seasonQyp.create({ data: { id: newId('qyp'), orgId: c.orgId, season: c.season, playerId: r.playerId, mainTeamId: r.mainTeamId, qypTeamId: r.qypTeamId, status: 'pending' } });
+    added++;
+  }
+  if (added) await notify(await orgAdminIds(c.orgId), { kind: 'entry', title: `${added} QYP ${added === 1 ? 'request' : 'requests'} for the ${c.season} season`, body: 'Players asking to play for a second club in another of your leagues this season. Approve or decline each one on the season page.', link: { pathname: '/organisation/[id]', params: { id: c.orgId } } });
+}
+
+/**
+ * After the organisation decides on a QYP player, their held registrations in the season are checked
+ * again: approved ones are released, declined ones stay held with the new reason.
+ */
+export async function recheckSeasonHolds(orgId: string, season: string, personId: string) {
+  const ctx = await seasonOf(orgId, season);
+  const person = await peopleOf([personId]);
+  const records = [...person.keys()];
+  const claimed = await prisma.player.findMany({ where: { claimedByUserId: personId }, select: { id: true } });
+  const owned = await prisma.user.findUnique({ where: { id: personId }, select: { playerId: true } }).catch(() => null);
+  const ids = [...new Set([...records, ...claimed.map((p) => p.id), ...(owned?.playerId ? [owned.playerId] : [])])];
+  const regRows = await prisma.registration.findMany({ where: { playerId: { in: ids } } });
+  const regs = regRows.map((r) => ({ ...toRegistration(r), playerId: personId }));
+  const comps = (await prisma.competition.findMany({ where: { id: { in: [...new Set(regs.map((r) => r.competitionId))] } } })).map(toCompetition);
+  const dob = (await prisma.player.findFirst({ where: { id: { in: ids }, dateOfBirth: { not: null } }, select: { dateOfBirth: true } }))?.dateOfBirth ?? (await prisma.user.findUnique({ where: { id: personId }, select: { dateOfBirth: true } }).catch(() => null))?.dateOfBirth ?? null;
+  for (const row of regRows.filter((r) => r.status === 'active' && r.heldReason && ctx.leagueIds.includes(r.competitionId))) {
+    const league = comps.find((x) => x.id === row.competitionId);
+    if (!league) continue;
+    const others = regs.filter((r) => !(r.competitionId === row.competitionId && r.teamId === row.teamId));
+    const verdict = registrationCheck({ playerId: personId, teamId: row.teamId, league, leagues: comps, regs: others, playerBirthDate: dob?.toISOString().slice(0, 10), leagueStartsOn: league.startsOn, season: ctx });
+    await prisma.registration.update({ where: { id: row.id }, data: { heldReason: verdict.ok ? null : verdict.reason } });
   }
 }

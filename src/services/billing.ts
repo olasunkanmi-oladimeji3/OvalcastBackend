@@ -4,7 +4,7 @@
 // is anything given: Pro, a wallet top-up, a pass, viewer credits or a paid entry.
 
 import type { Payment, User } from '@/api/types';
-import { currencyForCountry, formatMoney, refundDue, type PaidFeature, renewsOn, splitPass, splitWithStreamer, VIEWER_CREDIT_PACK, type BillingInterval, type FinanceCurrency, type PlanId } from '@/engine';
+import { currencyForCountry, formatMoney, refundDue, type PaidFeature, renewsOn, splitPass, splitWithStreamer, VIEWER_CREDIT_PACK, type BillingInterval, type FinanceCurrency, type PlanId, SMALL_STREAM_PLATFORM_SHARE, SMALL_STREAM_VIEWERS } from '@/engine';
 import { json, prisma, toJson } from '~/db/client';
 import { requestOrigin } from '~/lib/requestContext';
 import { ApiError } from '~/lib/errors';
@@ -306,6 +306,41 @@ export async function refundMatchPasses(matchId: string, reason: string) {
   // Rebuilt from what's left: refunded passes drop out, donations stay.
   await rebuildSales(matchId);
   return { refunded: passes.length, amount };
+}
+
+/**
+ * The small-stream rule, checked once when an Ovalcast stream ends: with fewer than 10 paying
+ * viewers, every pass and gift for the match splits 50/50 with Ovalcast after the payment fee
+ * (instead of the usual share), since the video still costs the same to carry. An approved
+ * streamer's part shrinks in proportion. Never lowers Ovalcast's share where it was already higher.
+ */
+export async function settleSmallStream(streamId: string) {
+  const s = await prisma.stream.findUnique({ where: { id: streamId } });
+  if (!s || s.status !== 'ended' || s.smallSettledAt || s.refundedAt || s.platform !== 'ovalcast') return false;
+  await prisma.stream.update({ where: { id: s.id }, data: { smallSettledAt: new Date() } });
+  const [passes, gifts] = await Promise.all([
+    prisma.matchPass.findMany({ where: { matchId: s.matchId, status: 'active' } }),
+    prisma.donation.findMany({ where: { matchId: s.matchId } }),
+  ]);
+  const payers = new Set([...passes.map((p) => p.userId), ...gifts.map((d) => d.userId ?? d.email ?? d.id)]).size;
+  if (!payers || payers >= SMALL_STREAM_VIEWERS) return false;
+  const resplit = (amount: number, fee: number, hostShare: number, streamerAmount: number) => {
+    const net = amount - fee;
+    const host = net - Math.round(net * SMALL_STREAM_PLATFORM_SHARE);
+    return host >= hostShare ? undefined : { hostShare: host, streamerAmount: hostShare > 0 ? Math.round((streamerAmount * host) / hostShare) : 0 };
+  };
+  for (const p of passes) {
+    const r = resplit(p.price, p.fee ?? 0, p.hostShare ?? 0, p.streamerAmount);
+    if (r) await prisma.matchPass.update({ where: { id: p.id }, data: { ...r, platformShare: SMALL_STREAM_PLATFORM_SHARE } });
+  }
+  for (const d of gifts) {
+    const r = resplit(d.amount, d.fee, d.hostShare, d.streamerAmount);
+    if (r) await prisma.donation.update({ where: { id: d.id }, data: { ...r, platformShare: SMALL_STREAM_PLATFORM_SHARE } });
+  }
+  await rebuildSales(s.matchId);
+  const offer = await prisma.passOffer.findUnique({ where: { matchId: s.matchId } });
+  if (offer) await notify(offer.hostUserId, { kind: 'payment', title: 'A small stream splits 50/50', body: `${payers} ${payers === 1 ? 'person' : 'people'} paid to watch, fewer than ${SMALL_STREAM_VIEWERS}, so this match's takings are shared 50/50 with Ovalcast after the payment fee. Streams with ${SMALL_STREAM_VIEWERS} or more paying viewers keep the usual share.`, link: { pathname: '/earnings' } });
+  return true;
 }
 
 /** Over 30% of a stream down: refund every pass for its match, once. */

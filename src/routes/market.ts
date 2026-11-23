@@ -6,6 +6,8 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { seasonOf } from '~/lib/seasons';
+import { toRegistration } from '~/lib/repo';
 import type { LeagueMarket, MarketListing, MarketPlayer, User } from '@/api/types';
 import { isQyp, transferWindowNow } from '@/engine';
 import { prisma } from '~/db/client';
@@ -45,22 +47,36 @@ export async function marketRoutes(app: FastifyInstance) {
     const seesAll = league || myTeamIds.length > 0;
     let ids = new Set(listings.map((l) => l.playerId).filter((p) => clubsOf.has(p)));
     const players = await prisma.player.findMany({ where: { id: { in: [...clubsOf.keys()] } }, select: { id: true, name: true, role: true, dateOfBirth: true } });
+    // QYP: players in the season's other leagues who may add this league as their second club
+    // (the season allows QYP, they're within its age, with one club so far). The organisation approves each.
     const qyp = new Set<string>();
+    const qypClub = new Map<string, string>();
     if (market.showQyp) {
-      const linked = await prisma.user.findMany({ where: { playerId: { in: players.filter((p) => !p.dateOfBirth).map((p) => p.id) } }, select: { playerId: true, dateOfBirth: true } });
-      const born = new Map(linked.filter((u) => u.playerId && u.dateOfBirth).map((u) => [u.playerId!, u.dateOfBirth!]));
-      for (const p of players) {
-        const dob = p.dateOfBirth ?? born.get(p.id);
-        if (isQyp(c.playerRules, clubsOf.get(p.id)!.length, dob?.toISOString().slice(0, 10), new Date(c.startsOn).toISOString())) qyp.add(p.id);
+      const season = await seasonOf(c.orgId, c.season);
+      if (season.qyp.enabled) {
+        const otherRegs = await prisma.registration.findMany({ where: { competitionId: { in: season.leagueIds.filter((l) => l !== c.id) }, status: 'active', playerId: { notIn: [...clubsOf.keys()] } } });
+        const candidates = await prisma.player.findMany({ where: { id: { in: [...new Set(otherRegs.map((r) => r.playerId))] } }, select: { id: true, name: true, role: true, dateOfBirth: true } });
+        const linked = await prisma.user.findMany({ where: { playerId: { in: candidates.filter((p) => !p.dateOfBirth).map((p) => p.id) } }, select: { playerId: true, dateOfBirth: true } });
+        const born = new Map(linked.filter((u) => u.playerId && u.dateOfBirth).map((u) => [u.playerId!, u.dateOfBirth!]));
+        const refs = otherRegs.map(toRegistration);
+        for (const p of candidates) {
+          const dob = p.dateOfBirth ?? born.get(p.id);
+          if (isQyp(p.id, c.id, season, refs, dob?.toISOString().slice(0, 10))) {
+            qyp.add(p.id);
+            qypClub.set(p.id, refs.find((r) => r.playerId === p.id)!.teamId);
+            players.push(p);
+          }
+        }
+        ids = new Set([...ids, ...qyp]);
       }
-      ids = new Set([...ids, ...qyp]);
     }
     if (!seesAll) ids = new Set([...ids].filter((p) => mine.includes(p)));
-    const teams = new Map((await prisma.team.findMany({ where: { id: { in: c.teamIds } }, select: { id: true, name: true } })).map((t) => [t.id, t.name]));
+    const teams = new Map((await prisma.team.findMany({ where: { id: { in: [...c.teamIds, ...qypClub.values()] } }, select: { id: true, name: true } })).map((t) => [t.id, t.name]));
     const byId = new Map(players.map((p) => [p.id, p]));
     const out: MarketPlayer[] = [...ids].map((pid) => {
       const p = byId.get(pid)!;
-      const main = clubsOf.get(pid)!.find((r) => r.primary) ?? clubsOf.get(pid)![0];
+      const here = clubsOf.get(pid);
+      const main = here ? (here.find((r) => r.primary) ?? here[0]) : { teamId: qypClub.get(pid)! };
       const open = listings.find((l) => l.playerId === pid && l.kind === 'open');
       const listed = listings.find((l) => l.playerId === pid && l.kind === 'listed');
       return { playerId: pid, name: p.name, role: p.role, teamId: main.teamId, teamName: teams.get(main.teamId) ?? 'Their club', ...(open ? { open: toListing(open) } : {}), ...(listed ? { listed: toListing(listed) } : {}), qyp: qyp.has(pid) };
@@ -84,7 +100,7 @@ export async function marketRoutes(app: FastifyInstance) {
     const kind = b.kind ?? (self ? 'open' : 'listed');
     if (kind === 'open' && !self) throw forbidden('Only the player can say they’re open to offers');
     if (kind === 'listed' && !club) throw forbidden('Only their club can list a player');
-    if (b.wants === 'dual' && !c.playerRules.multiClub.allowed) throw badRequest(`${c.name} allows one club per player`);
+    if (b.wants === 'dual') throw badRequest(`A player plays for one club in ${c.name}. A second club in another league this season is a QYP place, approved by the organisation`);
     const teamId = (kind === 'listed' ? club! : regs.find((r) => r.primary) ?? regs[0]).teamId;
     const existing = await prisma.marketListing.findFirst({ where: { competitionId: c.id, playerId: b.playerId, kind, status: 'active' } });
     const row = existing

@@ -3,6 +3,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { seasonOf } from '~/lib/seasons';
 import type { Competition, LeagueReport, Leaderboards, Match, Payment, SeriesSummary, Standings, Transfer } from '@/api/types';
 import { buildBracket, canTransfer, fitGroups, matchAwards, registrationCheck, roundRobin, standings, tableResult, transferOpen } from '@/engine';
 import { entryShareFor } from '~/lib/shares';
@@ -650,7 +651,8 @@ export async function competitionRoutes(app: FastifyInstance) {
     const comps = (await prisma.competition.findMany({ where: { id: { in: [...new Set([c.id, ...elsewhere.map((r) => r.competitionId)])] } } })).map(toCompetition);
     const dob = (await prisma.player.findMany({ where: { id: { in: [...mine] }, dateOfBirth: { not: null } }, select: { dateOfBirth: true } }))[0]?.dateOfBirth ?? (await prisma.user.findUnique({ where: { id: user.id }, select: { dateOfBirth: true } }))?.dateOfBirth;
     const names = new Map((await prisma.team.findMany({ where: { id: { in: here.map((r) => r.teamId) } }, select: { id: true, name: true } })).map((t) => [t.id, t.name]));
-    const check = (teamId: string, alongside: typeof everywhere) => registrationCheck({ playerId: user.id, teamId, league: c, leagues: comps, regs: [...elsewhere, ...alongside], teamName: (id) => names.get(id) ?? 'another club', playerBirthDate: dob?.toISOString().slice(0, 10), leagueStartsOn: new Date(c.startsOn).toISOString() });
+    const season = await seasonOf(c.orgId, c.season);
+    const check = (teamId: string, alongside: typeof everywhere) => registrationCheck({ playerId: user.id, teamId, league: c, leagues: comps, regs: [...elsewhere, ...alongside], teamName: (id) => names.get(id) ?? 'another club', playerBirthDate: dob?.toISOString().slice(0, 10), leagueStartsOn: new Date(c.startsOn).toISOString() , season });
     const mainVerdict = check(mainTeamId, []);
     const mainRef = { ...toRegistration(main), playerId: user.id, status: 'active' as const };
     const secondVerdict = secondTeamId ? check(secondTeamId, [mainRef]) : undefined;
@@ -680,8 +682,8 @@ export async function competitionRoutes(app: FastifyInstance) {
       if (Number.isNaN(Date.parse(w.opensOn)) || Number.isNaN(Date.parse(w.closesOn))) throw badRequest(`Give dates for ${w.name || 'each window'}`);
       if (w.closesOn < w.opensOn) throw badRequest(`${w.name || 'A window'} closes before it opens`);
     }
-    if (rules.market?.showQyp && rules.multiClub.maxAge === undefined) throw badRequest('Set a QYP age (second clubs for players this age or under) to show QYP players');
-    const saved = await prisma.competition.update({ where: { id: c.id }, data: { playerRules: toJson(rules) } });
+    // Second clubs are the season's QYP places, never two clubs in one league.
+    const saved = await prisma.competition.update({ where: { id: c.id }, data: { playerRules: toJson({ ...rules, multiClub: { allowed: false, maxClubs: 1 } }) } });
     return toCompetition(saved);
   });
 

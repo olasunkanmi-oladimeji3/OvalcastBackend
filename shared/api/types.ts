@@ -129,6 +129,8 @@ export interface Organisation {
   founded: number;
   executives: { name: string; title: string }[];
   sponsors: string[];
+  /** Sponsors shown on streams, with logos: one title sponsor always on screen, partners in turn. */
+  sponsorBrands?: SponsorBrand[];
   competitionIds: ID[];
   clubIds: ID[];
   country: string;
@@ -713,6 +715,47 @@ export interface RatingSummary {
   overall: number;
 }
 
+/** An organisation's season: its leagues with the same season label, and its QYP rules. */
+export interface OrgSeasonView {
+  orgId: ID;
+  season: string;
+  /** A second club, in another league of the season, for players this age or under on its first day whom the organisation approves. */
+  qyp: { enabled: boolean; maxAge: number };
+  leagues: { id: ID; name: string; status: 'entries' | 'inProgress' | 'completed'; startsOn: ISODate; clubs: number }[];
+  pendingQyp: number;
+}
+
+/** A player asking for (or given) a QYP place in a season: their main club and their second club. */
+export interface SeasonQypRequest {
+  id: ID;
+  season: string;
+  playerId: ID;
+  name: string;
+  mainTeamId: ID;
+  mainTeam: string;
+  qypTeamId: ID;
+  qypTeam: string;
+  status: 'pending' | 'approved' | 'declined';
+  at: ISODate;
+}
+
+/** A sponsor on a league's streams. The title sponsor stays on screen; partners take turns and fill the banner between overs. */
+export interface SponsorBrand {
+  id: ID;
+  name: string;
+  logoUrl?: string;
+  tier: 'title' | 'partner';
+}
+
+/** For a league's sponsors: what each got on the league's streams in a period. */
+export interface SponsorReport {
+  days: number;
+  streams: number;
+  liveMinutes: number;
+  views: number;
+  sponsors: { id: ID; name: string; tier: 'title' | 'partner'; logoUrl?: string; streams: number; minutesOnScreen: number; views: number }[];
+}
+
 /** One official at a match, with how they're rated in that job: overall, for this match, and whether you can rate them for it. */
 export interface MatchOfficialRating {
   userId: ID;
@@ -997,6 +1040,14 @@ export interface Stream {
   downSeconds?: number;
   /** Passes were refunded automatically: the stream was down for over 30% of it. */
   refunded?: boolean;
+  /** Whether the picture is reaching viewers: waiting (not started), live, or down (coming back). */
+  picture?: 'waiting' | 'live' | 'down';
+  /** When the picture last changed. */
+  pictureAt?: ISODate;
+  /** A replay in parts, when the stream dropped and reconnected: each part's address, in order. */
+  replayParts?: string[];
+  /** ovalcast: our video (paid or viewer-credit matches). youtube: free, on the club's or league's channel; playbackUrl is the YouTube link once added. */
+  platform?: 'ovalcast' | 'youtube';
 }
 
 /** A paid stream: fans buy a pass for the match (there are no season passes for streams). */
@@ -1236,8 +1287,8 @@ export interface LiveSetup {
   ingest: { protocol: 'rtmps' | 'srt'; url: string; streamKey: string };
   /** Add as a browser source in OBS or vMix. */
   overlayUrl: string;
-  /** Paid streams are never restreamed free to YouTube. */
-  youtube: 'restreaming' | 'notConnected' | 'blockedPaid';
+  /** Paid streams are never restreamed free to YouTube. direct: this stream goes straight to YouTube (free). */
+  youtube: 'restreaming' | 'notConnected' | 'blockedPaid' | 'direct';
 }
 
 /** A partner key issued by Ovalcast to an Organisation-plan customer. The key itself is shown once, at issue. */
@@ -1514,6 +1565,8 @@ export interface TeamSheet {
   reserves: ID[];
   captainId?: ID;
   keeperId?: ID;
+  /** Vice-captain for this match: in the XI, not the captain. */
+  viceCaptainId?: ID;
   submittedBy: ID;
   submittedByName: string;
   submittedAt: ISODate;
@@ -1526,6 +1579,7 @@ export interface MatchLineups {
     sheet?: TeamSheet;
     suggested: ID[];
     captainId?: ID;
+    viceCaptainId?: ID;
     keeperId?: ID;
     source: 'teamSheet' | 'lastMatch' | 'squad';
     lastMatch?: { matchId: ID; date: ISODate; opponentId: ID };
@@ -1852,7 +1906,9 @@ export interface OvalcastApi {
   getMilestones(playerId: ID): Promise<PlayerMilestones>;
 
   // Going live. POST /matches/:id/streams , POST /streams/:id/end , PUT /organisations/:id/youtube , PUT /teams/:id/youtube
-  startStream(matchId: ID, source: Stream['source']): Promise<LiveSetup>;
+  startStream(matchId: ID, source: Stream['source'], platform?: 'ovalcast' | 'youtube'): Promise<LiveSetup>;
+  // PUT /streams/:id/youtube-link: a free YouTube stream's link, so Ovalcast can play it
+  setYouTubeLink(streamId: ID, url: string): Promise<Stream>;
   endStream(streamId: ID): Promise<Stream>;
   // POST /streams/:id/health  (the host's phone, every 30 seconds: seconds live and down since the stream began)
   reportStreamHealth(streamId: ID, health: { liveSeconds: number; downSeconds: number }): Promise<Stream>;
@@ -1864,7 +1920,7 @@ export interface OvalcastApi {
 
   // Team sheets. GET /matches/:id/lineups , PUT /matches/:id/team-sheets/:teamId (that club's admin, before the start)
   getLineups(matchId: ID): Promise<MatchLineups>;
-  submitTeamSheet(matchId: ID, teamId: ID, sheet: { playerIds: ID[]; reserves: ID[]; captainId?: ID; keeperId?: ID }): Promise<TeamSheet>;
+  submitTeamSheet(matchId: ID, teamId: ID, sheet: { playerIds: ID[]; reserves: ID[]; captainId?: ID; keeperId?: ID; viceCaptainId?: ID }): Promise<TeamSheet>;
 
   // GET /players/:id/shots
   getPlayerShots(playerId: ID): Promise<PlayerShotProfile>;
@@ -1883,6 +1939,18 @@ export interface OvalcastApi {
   // Branding. PATCH /organisations/:id , POST /organisations/:id/images , POST /competitions/:id/images (multipart)
   updateOrganisation(orgId: ID, patch: Partial<Pick<Organisation, 'about' | 'sponsors' | 'brandColor' | 'executives'>>): Promise<Organisation>;
   uploadOrganisationImage(orgId: ID, kind: 'logo' | 'cover', fileUri: string): Promise<Organisation>;
+  // PUT /organisations/:id/sponsor-brands , POST /organisations/:id/sponsor-logo , GET /organisations/:id/sponsor-report
+  // Seasons: GET /organisations/:id/seasons , PUT /organisations/:id/season , GET /organisations/:id/season/qyp?season= , POST /season-qyp/:id
+  listSeasons(orgId: ID): Promise<OrgSeasonView[]>;
+  setSeasonRules(orgId: ID, season: string, rules: { qypEnabled: boolean; qypMaxAge: number }): Promise<OrgSeasonView>;
+  listSeasonQyp(orgId: ID, season: string): Promise<SeasonQypRequest[]>;
+  decideQyp(requestId: ID, decision: 'approve' | 'decline', swap?: boolean): Promise<{ ok: true }>;
+  /** A player whose main and QYP clubs meet: allowed for this match, for one club (or the allowance removed). */
+  allowClash(matchId: ID, playerId: ID, teamId: ID): Promise<{ ok: true }>;
+  removeClashAllowance(matchId: ID, playerId: ID): Promise<{ ok: true }>;
+  setSponsorBrands(orgId: ID, brands: (Omit<SponsorBrand, 'id'> & { id?: ID })[]): Promise<Organisation>;
+  uploadSponsorLogo(orgId: ID, fileUri: string): Promise<{ url: string }>;
+  getSponsorReport(orgId: ID, days: number): Promise<SponsorReport>;
   uploadCompetitionImage(competitionId: ID, kind: 'logo' | 'cover', fileUri: string): Promise<Competition>;
 
   // Fixtures. PATCH /matches/:id (league admin) , POST /matches/:id/outcome , POST /matches/:id/fixture-requests (club admin) , GET /competitions/:id/fixture-requests , POST /fixture-requests/:id/respond

@@ -45,6 +45,24 @@ export async function addRestream(uid: string, url: string, streamKey: string) {
   await cf('POST', `/live_inputs/${uid}/outputs`, { url, streamKey, enabled: true });
 }
 
+/** Whether a picture is reaching the live input right now. */
+export async function liveInputConnected(uid: string): Promise<boolean> {
+  const r = await cf<{ status?: { current?: { state?: string } } | null }>('GET', `/live_inputs/${uid}`);
+  return r.status?.current?.state === 'connected';
+}
+
+/**
+ * Every recording of a live input that's ready, oldest first: one per connection, so a stream that
+ * dropped and reconnected has several parts.
+ */
+export async function recordingsOf(uid: string): Promise<string[]> {
+  const videos = await cf<{ uid: string; created?: string; readyToStream?: boolean; status?: { state?: string } }[]>('GET', `/live_inputs/${uid}/videos`);
+  return videos
+    .filter((v) => v.readyToStream || v.status?.state === 'ready')
+    .sort((a, b) => (a.created ?? '').localeCompare(b.created ?? ''))
+    .map((v) => `${host()}/${v.uid}/manifest/video.m3u8`);
+}
+
 /** The recording of a finished live input, for the replay: the newest one that's ready. */
 export async function recordingOf(uid: string): Promise<string | undefined> {
   const videos = await cf<{ uid: string; readyToStream?: boolean; status?: { state?: string } }[]>('GET', `/live_inputs/${uid}/videos`);

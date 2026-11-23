@@ -26,6 +26,47 @@ export interface RegistrationRef {
   teamId: string;
   primary: boolean;
   status: 'active' | 'ended';
+  /** When they joined that club's squad (ISO), to tell their main club in a season. */
+  since?: string;
+}
+
+/**
+ * An organisation's season: every one of its leagues with the same season label. A player plays for
+ * one club per league, always. A second club in another league of the season is a QYP place: the
+ * season allows it, the player is within its age on the season's first day, and the organisation
+ * approves them. Their main club is the first they joined that season (the organisation can swap).
+ */
+export interface SeasonContext {
+  orgId: string;
+  season: string;
+  qyp: { enabled: boolean; maxAge: number };
+  /** The day the season's first league starts (YYYY-MM-DD or ISO): QYP age is judged on it. */
+  startsOn: string;
+  /** The season's leagues. */
+  leagueIds: string[];
+  /** The organisation's QYP decisions for this season, by person. */
+  decisions: { playerId: string; status: 'pending' | 'approved' | 'declined'; mainTeamId?: string }[];
+}
+
+/** A player's clubs in a season: their main club (first joined, unless the organisation swapped) and their QYP club. */
+export function seasonClubs(playerId: string, season: SeasonContext, regs: RegistrationRef[]): { main?: string; qyp?: string; all: string[] } {
+  const mine = regs.filter((r) => r.playerId === playerId && r.status === 'active' && season.leagueIds.includes(r.competitionId)).sort((a, b) => (a.since ?? '').localeCompare(b.since ?? ''));
+  const all = [...new Set(mine.map((r) => r.teamId))];
+  const chosen = season.decisions.find((d) => d.playerId === playerId)?.mainTeamId;
+  const main = chosen && all.includes(chosen) ? chosen : all[0];
+  return { main, qyp: all.find((t) => t !== main), all };
+}
+
+/**
+ * When a player's main and QYP clubs meet in a season, they can't play unless the organisation
+ * allows it for that match and club. Returns why not, or undefined when they may play.
+ */
+export function seasonClashReason(args: { playerId: string; teamId: string; otherTeamId: string; season: SeasonContext; regs: RegistrationRef[]; allowedTeamId?: string; teamName?: (id: string) => string }): string | undefined {
+  const { all, main } = seasonClubs(args.playerId, args.season, args.regs);
+  if (!all.includes(args.teamId) || !all.includes(args.otherTeamId)) return undefined;
+  if (args.allowedTeamId === args.teamId) return undefined;
+  const name = (id: string) => args.teamName?.(id) ?? 'their other club';
+  return `Plays for both clubs this season (main club ${name(main ?? args.teamId)}). Blocked when they meet unless the organisation allows it for this match`;
 }
 
 /**
@@ -111,17 +152,8 @@ export function canTransfer(args: {
   const mine = regs.filter((r) => r.playerId === playerId && r.competitionId === league.id && r.status === 'active');
   if (!mine.some((r) => r.teamId === args.fromTeamId)) return { ok: false, reason: 'The player is not in that club’s squad for this league' };
   if (mine.some((r) => r.teamId === args.toTeamId)) return { ok: false, reason: 'The player is already in your squad for this league' };
-  if (args.kind === 'dual') {
-    if (!rules.multiClub.allowed) return { ok: false, reason: `${league.name} allows one club per player` };
-    if (mine.length >= rules.multiClub.maxClubs) return { ok: false, reason: `Already plays for ${mine.length} clubs, the most ${league.name} allows` };
-    const maxAge = rules.multiClub.maxAge;
-    if (maxAge !== undefined) {
-      const on = args.leagueStartsOn ?? now.toISOString();
-      if (!args.playerBirthDate) return { ok: false, reason: `${league.name} lets players aged ${maxAge} or under play for a second club. Add the player’s date of birth first` };
-      const age = ageOn(args.playerBirthDate, on);
-      if (age > maxAge) return { ok: false, reason: `${league.name} lets players aged ${maxAge} or under play for a second club; they’re ${age} on ${day(on)}` };
-    }
-  }
+  // One club per player in a league, always: a second club is in another league of the season (QYP).
+  if (args.kind === 'dual') return { ok: false, reason: `A player plays for one club in ${league.name}. A second club in another league this season is a QYP place, approved by the organisation` };
   const used = args.transfers.filter(
     (t) => t.playerId === playerId && t.competitionId === league.id && (t.status === 'approved' || (!args.excludePending && transferOpen(t))),
   ).length;
@@ -155,25 +187,38 @@ export function registrationCheck(args: {
   playerBirthDate?: string;
   leagueStartsOn?: string;
   now?: Date;
-}): { ok: true; primary: boolean } | { ok: false; reason: string; canChoose: boolean } {
+  /** The league's season, when it has one: second clubs across its leagues follow the season's QYP rules. */
+  season?: SeasonContext;
+}): { ok: true; primary: boolean } | { ok: false; reason: string; canChoose: boolean; qypRequest?: { mainTeamId: string; qypTeamId: string } } {
   const { league, playerId, teamId, regs } = args;
   const name = (id: string) => args.teamName?.(id) ?? 'another club';
   const rules = league.playerRules;
   const here = regs.filter((r) => r.playerId === playerId && r.competitionId === league.id && r.status === 'active' && r.teamId !== teamId);
   const clubs = [...new Set(here.map((r) => r.teamId))];
-  if (clubs.length) {
-    const already = clubs.map(name).join(' and ');
-    if (!rules.multiClub.allowed) return { ok: false, reason: `Already plays for ${already} in ${league.name}, which allows one club per player`, canChoose: true };
-    if (clubs.length + 1 > rules.multiClub.maxClubs) return { ok: false, reason: `Already plays for ${already}; ${league.name} allows ${rules.multiClub.maxClubs} clubs per player`, canChoose: true };
-    const maxAge = rules.multiClub.maxAge;
-    if (maxAge !== undefined) {
-      if (!args.playerBirthDate) return { ok: false, reason: `Already plays for ${already}. A second club here is for players aged ${maxAge} or under, and there's no date of birth on record`, canChoose: true };
-      const on = args.leagueStartsOn ?? (args.now ?? new Date()).toISOString();
-      const age = ageOn(args.playerBirthDate, on);
-      if (age > maxAge) return { ok: false, reason: `Already plays for ${already}. A second club here is for players aged ${maxAge} or under; they're ${age}`, canChoose: true };
+  // One club per player in a league, always: fair play between the clubs in it.
+  void rules;
+  if (clubs.length) return { ok: false, reason: `Already plays for ${clubs.map(name).join(' and ')} in ${league.name}. A player plays for one club per league`, canChoose: true };
+  const season = args.season;
+  if (season) {
+    // Their clubs in the season's other leagues (a club playing in two of them is still one club).
+    const { all, main } = seasonClubs(playerId, season, regs.filter((r) => r.competitionId !== league.id));
+    const others = all.filter((t) => t !== teamId);
+    if (others.length) {
+      const already = others.map(name).join(' and ');
+      const label = `the ${season.season} season`;
+      if (others.length >= 2) return { ok: false, reason: `Already plays for ${already} in ${label}. A QYP player has one second club`, canChoose: false };
+      if (!season.qyp.enabled) return { ok: false, reason: `Already plays for ${already} in ${label}, which allows one club per player`, canChoose: true };
+      if (!args.playerBirthDate) return { ok: false, reason: `Already plays for ${already}. A second club this season is for QYP players aged ${season.qyp.maxAge} or under, and there's no date of birth on record`, canChoose: true };
+      const age = ageOn(args.playerBirthDate, season.startsOn);
+      if (age > season.qyp.maxAge) return { ok: false, reason: `Already plays for ${already}. A second club this season is for QYP players aged ${season.qyp.maxAge} or under; they're ${age}`, canChoose: true };
+      const decision = season.decisions.find((d) => d.playerId === playerId);
+      if (decision?.status === 'declined') return { ok: false, reason: `The organisation declined them as a QYP player for ${label}`, canChoose: true };
+      if (decision?.status !== 'approved') return { ok: false, reason: `Waiting for the organisation to approve them as a QYP player for ${label} (second club, with ${already})`, canChoose: false, qypRequest: { mainTeamId: main ?? others[0], qypTeamId: teamId } };
     }
   }
-  const clash = otherLeagueConflicts(playerId, league, args.leagues, regs)[0];
+  // Leagues outside this season keep their own rules about players in other leagues.
+  const outside = season ? args.leagues.filter((l) => !season.leagueIds.includes(l.id)) : args.leagues;
+  const clash = otherLeagueConflicts(playerId, league, outside, regs)[0];
   if (clash) return { ok: false, reason: clash.reason, canChoose: false };
   return { ok: true, primary: clubs.length === 0 };
 }
@@ -193,13 +238,13 @@ export function transferWindowNow(league: LeagueRef, now = new Date()): { open: 
 }
 
 /**
- * A qualified young player (QYP) in this league: second clubs are allowed with an age limit, the
- * player is within it on the day the league starts, and has room for another club here.
- * Without a date of birth on record nobody is QYP.
+ * A qualified young player (QYP) for a league in its season: the season allows QYP, the player is
+ * within its age on the season's first day, has exactly one club in the season's other leagues and
+ * none in this one. Without a date of birth on record nobody is QYP.
  */
-export function isQyp(rules: LeagueRules, clubsHere: number, birthDate: string | undefined, leagueStartsOn: string): boolean {
-  const m = rules.multiClub;
-  if (!m.allowed || m.maxAge === undefined || !birthDate) return false;
-  if (clubsHere < 1 || clubsHere >= m.maxClubs) return false;
-  return ageOn(birthDate, leagueStartsOn) <= m.maxAge;
+export function isQyp(playerId: string, leagueId: string, season: SeasonContext | undefined, regs: RegistrationRef[], birthDate: string | undefined): boolean {
+  if (!season?.qyp.enabled || !birthDate) return false;
+  if (regs.some((r) => r.playerId === playerId && r.competitionId === leagueId && r.status === 'active')) return false;
+  const { all } = seasonClubs(playerId, season, regs);
+  return all.length === 1 && ageOn(birthDate, season.startsOn) <= season.qyp.maxAge;
 }

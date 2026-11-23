@@ -73,6 +73,10 @@ export function passPriceOptions(oversPerInnings: number, currency: FinanceCurre
  * everyone, an organisation or a streamer). The streamer keeps the rest. Free streams carry none.
  */
 export const DEFAULT_PLATFORM_SHARE = 0.25;
+/** A paid stream that ends with fewer paying viewers than this splits the match 50/50 with Ovalcast. */
+export const SMALL_STREAM_VIEWERS = 10;
+/** Ovalcast's share of a small stream's passes and gifts, after the payment fee. */
+export const SMALL_STREAM_PLATFORM_SHARE = 0.5;
 
 /** A share as staff may set it: 0 to 90%, to a tenth of a percent. */
 export const validShare = (n: number) => Number.isFinite(n) && n >= 0 && n <= 0.9 && Math.abs(n * 1000 - Math.round(n * 1000)) < 1e-9;

@@ -2,6 +2,7 @@
 // payouts, withdrawals, fee reminders, and the provider's webhook.
 
 import { logMoney } from '~/lib/moneyLog';
+import { applyPicture } from '~/lib/streamPicture';
 import { open as openSecret, seal } from '~/lib/secrets';
 import { settleTransfer } from '~/routes/payouts';
 import type { FastifyRequest } from 'fastify';
@@ -197,6 +198,18 @@ export async function financeRoutes(app: FastifyInstance) {
  * before the checkout is completed. Each event is applied once.
  */
 export async function webhookRoutes(app: FastifyInstance) {
+  // Cloudflare tells us the moment a live input connects or drops (a Stream Live Input notification
+  // with a webhook destination). Optional: the 20-second check does the same without it.
+  app.post('/webhooks/cloudflare-stream', async (req, reply) => {
+    const secret = process.env.CLOUDFLARE_STREAM_WEBHOOK_SECRET;
+    if (!secret || req.headers['cf-webhook-auth'] !== secret) return reply.status(401).send({ message: 'Bad signature' });
+    const b = z.object({ data: z.object({ input_id: z.string(), event_type: z.string() }).passthrough() }).passthrough().safeParse(req.body);
+    if (!b.success) return reply.status(200).send({ ok: true, ignored: true });
+    const s = await prisma.stream.findFirst({ where: { liveInputId: b.data.data.input_id, status: 'live' } });
+    if (s) await applyPicture(s, b.data.data.event_type === 'live_input.connected');
+    return reply.status(200).send({ ok: true });
+  });
+
   app.post('/webhooks/flutterwave', async (req, reply) => {
     if (!verifyFlutterwaveHash(req.headers['verif-hash'] as string | undefined)) return reply.status(401).send({ message: 'Bad signature' });
     // A transfer finished (a withdrawal): ask Flutterwave for its status rather than trust the body.

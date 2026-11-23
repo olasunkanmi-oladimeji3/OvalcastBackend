@@ -4,7 +4,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { createOrganisation, newOrganisationSchema } from '~/services/organisations';
-import { refundIfMostlyDown } from '~/services/billing';
+import { refundIfMostlyDown, settleSmallStream } from '~/services/billing';
 import type { ApiClientSummary, LiveSetup, MatchEligibility, MatchLineups, Organisation, PlayerClaim, TeamSheet, RulesDocumentVersion, Stream } from '@/api/types';
 import { milestoneChase, milestoneLines, playerShotProfile } from '@/engine';
 import type * as P from '~/generated/prisma/client';
@@ -16,7 +16,8 @@ import { newId } from '~/lib/ids';
 import { publish } from '~/lib/live';
 import { isClubAdmin, isLeagueAdmin, notify, toCompetition, toMatch, toOrg } from '~/lib/repo';
 import { open as openSecret, seal } from '~/lib/secrets';
-import { addRestream, closeLiveInput, createLiveInput, videoConfigured } from '~/lib/video';
+import { addRestream, closeLiveInput, createLiveInput, liveInputConnected, videoConfigured } from '~/lib/video';
+import { applyPicture } from '~/lib/streamPicture';
 import { storage } from '~/lib/storage';
 import { recordStreamView } from '~/lib/audience';
 import { requireFeature } from '~/services/billing';
@@ -31,7 +32,13 @@ import { eligibilityFor } from '~/routes/matches';
 const HANDOVER_MINUTES = 10;
 
 const toClaim = (c: P.PlayerClaim): PlayerClaim => ({ ...c, status: c.status as PlayerClaim['status'], note: c.note ?? undefined, createdAt: c.createdAt.toISOString(), respondedAt: c.respondedAt?.toISOString() });
-const toStream = (s: P.Stream): Stream => ({ id: s.id, matchId: s.matchId, status: s.status as Stream['status'], playbackUrl: s.playbackUrl, viewers: s.viewers, latencySeconds: s.latencySeconds, source: s.source as Stream['source'], streamer: s.streamer, liveSeconds: s.liveSeconds, downSeconds: s.downSeconds, refunded: !!s.refundedAt || undefined });
+/** The 11-character video id from any YouTube address (watch, live, youtu.be, shorts, embed), or undefined. */
+export function youtubeVideoId(url: string): string | undefined {
+  const m = url.match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|live\/|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})(?![\w-])/);
+  return m?.[1];
+}
+
+const toStream = (s: P.Stream): Stream => ({ id: s.id, matchId: s.matchId, status: s.status as Stream['status'], playbackUrl: s.playbackUrl, viewers: s.viewers, latencySeconds: s.latencySeconds, source: s.source as Stream['source'], streamer: s.streamer, liveSeconds: s.liveSeconds, downSeconds: s.downSeconds, refunded: !!s.refundedAt || undefined, picture: s.picture as Stream['picture'], ...(s.pictureAt ? { pictureAt: s.pictureAt.toISOString() } : {}), ...(Array.isArray(s.replayParts) ? { replayParts: s.replayParts as string[] } : {}), platform: s.platform as Stream['platform'] });
 const ruleUrl = (competitionId: string, version: number) => `/api/v1/competitions/${competitionId}/rules/${version}/file`;
 
 async function orgOfMatch(competitionId?: string) {
@@ -189,11 +196,44 @@ export async function featureRoutes(app: FastifyInstance) {
   // ------------------------------------------------------------ going live
   app.post<{ Params: { id: string } }>('/matches/:id/streams', async (req): Promise<LiveSetup> => {
     const user = requireUser(req);
-    const { source } = z.object({ source: z.enum(['phone', 'encoder']) }).parse(req.body);
+    const { source, platform } = z.object({ source: z.enum(['phone', 'encoder']), platform: z.enum(['ovalcast', 'youtube']).default('ovalcast') }).parse(req.body);
     const m = await getMatch(req.params.id);
     const orgId = await orgOfMatch(m.competitionId);
     // The organiser, streamers they approved for this match, and the club's or league's Media list.
     if (!(await mayStream(user, m))) throw forbidden('Only the organiser, or someone they’ve approved to stream, can stream this match. Ask to stream it from the match page.');
+    // Without the video service there's no picture to show: going live would put a dead "Watch live"
+    // on the match (and sell passes for it), so production refuses until it's set up.
+    const paid = !!(await prisma.passOffer.findUnique({ where: { matchId: m.id } }));
+    const overlayUrl = `${process.env.WEB_URL ?? 'https://ovalcast.app'}/overlay/${m.id}`;
+
+    // Free on YouTube: the phone or encoder sends straight to the league's or club's channel, and
+    // Ovalcast shows that video once its link is added. Costs Ovalcast nothing; no passes.
+    if (platform === 'youtube') {
+      if (paid) throw conflict('This match sells passes, so it streams on Ovalcast, where only pass holders can watch');
+      const yt = await prisma.youTubeKey.findFirst({ where: { ownerId: { in: [orgId ?? '', m.homeTeamId, m.awayTeamId] } } });
+      if (!yt) throw conflict('Connect a YouTube channel first: the league or a club adds its YouTube stream key on its page');
+      const { stream: ys, created: yc } = await prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`select pg_advisory_xact_lock(hashtext(${m.id}))`;
+        const existing = await tx.stream.findFirst({ where: { matchId: m.id, status: { not: 'ended' } } });
+        if (existing) return { stream: existing, created: false };
+        return { stream: await tx.stream.create({ data: { id: newId('stream'), matchId: m.id, status: 'live', platform: 'youtube', playbackUrl: '', viewers: 0, latencySeconds: 15, source, streamer: user.name, startedBy: user.id } }), created: true };
+      });
+      if (ys.platform !== 'youtube') throw conflict('This match is already streaming on Ovalcast');
+      if (yc) {
+        m.streamId = ys.id;
+        await saveMatch(m);
+        publish(m.id, { type: 'status', match: m });
+      }
+      return { stream: toStream(ys), ingest: { protocol: 'rtmps', url: 'rtmps://a.rtmps.youtube.com:443/live2/', streamKey: openSecret(yt.keyEnc) }, overlayUrl, youtube: 'direct' };
+    }
+
+    if (!videoConfigured() && process.env.NODE_ENV === 'production') throw new ApiError(503, 'Live video isn’t switched on yet. Ovalcast is setting it up. Stream free on YouTube, or record the match on your phone and share the video');
+    // Ovalcast's video costs money to carry, so it's for matches someone pays for: viewers (passes or
+    // gifts) or the league (viewer credits). Free matches stream on YouTube.
+    if (videoConfigured() && !paid) {
+      const credits = orgId ? ((await prisma.organisation.findUnique({ where: { id: orgId }, select: { viewerHoursLeft: true } }))?.viewerHoursLeft ?? 0) : 0;
+      if (credits <= 0) throw conflict('Free matches stream on YouTube. To stream on Ovalcast, sell match passes or take gifts, or buy viewer credits for the league');
+    }
     // One live stream per match, even when two requests arrive together (a double tap, two devices):
     // the match's lock is held while checking and creating.
     const { stream: s, created } = await prisma.$transaction(async (tx) => {
@@ -205,6 +245,7 @@ export async function featureRoutes(app: FastifyInstance) {
       const row = await tx.stream.create({ data: { id: newId('stream'), matchId: m.id, status: 'live', playbackUrl: `https://customer-dev.cloudflarestream.com/${liveInputId}/manifest/video.m3u8`, viewers: 0, latencySeconds: source === 'phone' ? 5 : 8, source, streamer: user.name, liveInputId, startedBy: user.id } });
       return { stream: row, created: true };
     });
+    if (s.platform !== 'ovalcast') throw conflict('This match is already streaming free on YouTube');
     let s2 = s;
     if (created && videoConfigured()) {
       // A Cloudflare Stream live input for this stream: RTMPS in, HLS out, recorded for the replay.
@@ -229,15 +270,30 @@ export async function featureRoutes(app: FastifyInstance) {
       publish(m.id, { type: 'status', match: m });
       void emitPartnerEvent('stream.live', m.id, { streamId: s.id });
     }
-    const paid = !!(await prisma.passOffer.findUnique({ where: { matchId: m.id } }));
     const yt = await prisma.youTubeKey.findFirst({ where: { ownerId: { in: [orgId ?? '', m.homeTeamId] } } });
     return {
       stream: toStream(s2),
       ingest: s2.ingestKeyEnc && s2.ingestUrl ? { protocol: 'rtmps', url: s2.ingestUrl, streamKey: openSecret(s2.ingestKeyEnc) } : { protocol: 'rtmps', url: 'rtmps://live.cloudflare.com:443/live/', streamKey: liveInputId },
       // The website serves the overlay: a transparent page for OBS or vMix, with the client's logo and sponsors.
-      overlayUrl: `${process.env.WEB_URL ?? 'https://ovalcast.app'}/overlay/${m.id}`,
+      overlayUrl,
       youtube: paid ? 'blockedPaid' : yt ? 'restreaming' : 'notConnected',
     };
+  });
+
+  // A free YouTube stream's link, pasted from YouTube by whoever streams it or the organiser, so
+  // Ovalcast can play it. Only a YouTube video address is accepted.
+  app.put<{ Params: { id: string } }>('/streams/:id/youtube-link', async (req) => {
+    const user = requireUser(req);
+    const { url } = z.object({ url: z.string().trim().max(300) }).parse(req.body);
+    const s = await prisma.stream.findUnique({ where: { id: req.params.id } });
+    if (!s) throw notFound('Stream');
+    if (s.platform !== 'youtube') throw conflict('Only a free YouTube stream takes a YouTube link');
+    if (s.startedBy !== user.id && !(await organisesMatch(user, await getMatch(s.matchId)))) throw forbidden('Only whoever streams it, or the match’s organiser, can add the link');
+    const id = youtubeVideoId(url);
+    if (!id) throw badRequest('Paste the link to the YouTube video or live stream, such as youtube.com/live/… or youtu.be/…');
+    const saved = await prisma.stream.update({ where: { id: s.id }, data: { playbackUrl: `https://www.youtube.com/watch?v=${id}` } });
+    publish(s.matchId, { type: 'status', match: await getMatch(s.matchId) });
+    return toStream(saved);
   });
 
   // Someone opened the stream (live or replay): counted for the league's season report. No sign-in;
@@ -257,9 +313,13 @@ export async function featureRoutes(app: FastifyInstance) {
     if (!s) throw notFound('Stream');
     const orgId = await orgOfMatch(s.match.competitionId ?? undefined);
     if (s.startedBy !== user.id && !(await organisesMatch(user, await getMatch(s.matchId)))) throw forbidden('Only whoever started the stream, or the match’s organiser, can end it');
+    // Count the picture up to the end first, so the refund rule sees the whole stream.
+    if (s.liveInputId && videoConfigured()) await applyPicture(s, await liveInputConnected(s.liveInputId).catch(() => s.picture === 'live')).catch(() => undefined);
     await prisma.stream.update({ where: { id: s.id }, data: { status: 'ended' } });
     if (s.liveInputId && videoConfigured()) await closeLiveInput(s.liveInputId);
     await refundIfMostlyDown(s.id);
+    // Under 10 paying viewers: the match splits 50/50 (checked once, after any refund).
+    await settleSmallStream(s.id);
     // Watchers and the match page hear it has ended.
     publish(s.matchId, { type: 'status', match: await getMatch(s.matchId) });
     return toStream((await prisma.stream.findUnique({ where: { id: s.id } }))!);
@@ -293,7 +353,7 @@ export async function featureRoutes(app: FastifyInstance) {
   app.put<{ Params: { id: string } }>('/teams/:id/youtube', youtube('team'));
 
   // ------------------------------------------------------- team sheets
-  const toSheet = (t: P.TeamSheet): TeamSheet => ({ matchId: t.matchId, teamId: t.teamId, playerIds: json<string[]>(t.playerIds), reserves: json<string[]>(t.reserves), captainId: t.captainId ?? undefined, keeperId: t.keeperId ?? undefined, submittedBy: t.submittedBy, submittedByName: t.submittedByName, submittedAt: t.submittedAt.toISOString() });
+  const toSheet = (t: P.TeamSheet): TeamSheet => ({ matchId: t.matchId, teamId: t.teamId, playerIds: json<string[]>(t.playerIds), reserves: json<string[]>(t.reserves), captainId: t.captainId ?? undefined, keeperId: t.keeperId ?? undefined, viceCaptainId: t.viceCaptainId ?? undefined, submittedBy: t.submittedBy, submittedByName: t.submittedByName, submittedAt: t.submittedAt.toISOString() });
   const ROLE_ORDER: Record<string, number> = { keeper: 0, batter: 1, allRounder: 2, bowler: 3 };
 
   /** What the scorer starts from: the club's team sheet, else its last XI, else a balanced side. Only eligible players. */
@@ -313,7 +373,7 @@ export async function featureRoutes(app: FastifyInstance) {
       const ok = new Set((elig.teams[teamId] ?? []).filter((x) => x.ok).map((x) => x.playerId));
       const sheet = sheets.find((x) => x.teamId === teamId);
       if (sheet) {
-        out.teams[teamId] = { sheet, suggested: sheet.playerIds.filter((id) => ok.has(id)), captainId: sheet.captainId, keeperId: sheet.keeperId, source: 'teamSheet' };
+        out.teams[teamId] = { sheet, suggested: sheet.playerIds.filter((id) => ok.has(id)), captainId: sheet.captainId, keeperId: sheet.keeperId, viceCaptainId: sheet.viceCaptainId, source: 'teamSheet' };
         continue;
       }
       if (split) {
@@ -338,7 +398,7 @@ export async function featureRoutes(app: FastifyInstance) {
 
   app.put<{ Params: { id: string; teamId: string } }>('/matches/:id/team-sheets/:teamId', async (req) => {
     const user = requireUser(req);
-    const b = z.object({ playerIds: z.array(z.string()).min(2).max(11), reserves: z.array(z.string()).max(10).default([]), captainId: z.string().optional(), keeperId: z.string().optional() }).parse(req.body);
+    const b = z.object({ playerIds: z.array(z.string()).min(2).max(11), reserves: z.array(z.string()).max(10).default([]), captainId: z.string().optional(), keeperId: z.string().optional(), viceCaptainId: z.string().optional() }).parse(req.body);
     const m = await getMatch(req.params.id);
     const teamId = req.params.teamId;
     if (teamId !== m.homeTeamId && teamId !== m.awayTeamId) throw badRequest('That club is not in this match');
@@ -349,12 +409,14 @@ export async function featureRoutes(app: FastifyInstance) {
     if (new Set(b.playerIds).size !== b.playerIds.length) throw badRequest('A player is listed twice');
     if (b.captainId && !b.playerIds.includes(b.captainId)) throw badRequest('The captain must be in the XI');
     if (b.keeperId && !b.playerIds.includes(b.keeperId)) throw badRequest('The wicketkeeper must be in the XI');
+    if (b.viceCaptainId && !b.playerIds.includes(b.viceCaptainId)) throw badRequest('The vice-captain must be in the XI');
+    if (b.viceCaptainId && b.viceCaptainId === b.captainId) throw badRequest('The vice-captain can’t also be the captain');
     // Only players this club may field in this match.
     const elig = await eligibilityFor(m.id);
     const ok = new Set((elig.teams[teamId] ?? []).filter((x) => x.ok).map((x) => x.playerId));
     const bad = [...b.playerIds, ...b.reserves].find((id) => !ok.has(id));
     if (bad) throw conflict('Someone on the sheet cannot play in this match. Check the eligibility notes.');
-    const data = { playerIds: toJson(b.playerIds), reserves: toJson(b.reserves.filter((r) => !b.playerIds.includes(r))), captainId: b.captainId ?? null, keeperId: b.keeperId ?? null, submittedBy: user.id, submittedByName: user.name, submittedAt: new Date() };
+    const data = { playerIds: toJson(b.playerIds), reserves: toJson(b.reserves.filter((r) => !b.playerIds.includes(r))), captainId: b.captainId ?? null, keeperId: b.keeperId ?? null, viceCaptainId: b.viceCaptainId ?? null, submittedBy: user.id, submittedByName: user.name, submittedAt: new Date() };
     const saved = await prisma.teamSheet.upsert({ where: { matchId_teamId: { matchId: m.id, teamId } }, create: { matchId: m.id, teamId, ...data }, update: data });
     if (m.officials.scorerUserId && m.officials.scorerUserId !== user.id) await notify(m.officials.scorerUserId, { kind: 'match', title: `${team.name} sent their team sheet`, body: 'It is ready in match setup.', link: { pathname: '/match/[id]', params: { id: m.id } } });
     return toSheet(saved);

@@ -6,7 +6,9 @@ import { randomInt } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { BallEventInput, Match, MatchEligibility, OfficialInvite, TossSession, User } from '@/api/types';
-import { clubWhenClubsMeet, otherLeagueConflicts, type BallEvent } from '@/engine';
+import { clubWhenClubsMeet, otherLeagueConflicts, seasonClashReason, type BallEvent } from '@/engine';
+import { seasonOf } from '~/lib/seasons';
+import { peopleOf } from '~/lib/registration';
 import type * as P from '~/generated/prisma/client';
 import { isUniqueViolation, json, prisma } from '~/db/client';
 import { openFeed } from '~/lib/rateLimit';
@@ -144,6 +146,15 @@ export async function eligibilityFor(matchId: string): Promise<MatchEligibility>
   ]);
   const comps = c ? await prisma.competition.findMany({ where: { id: { in: [...new Set(regs.map((r) => r.competitionId))] } } }) : [];
   const groupMatches = c ? (await prisma.match.findMany({ where: { competitionId: c.id, status: 'completed' } })).map(toMatch).filter((x) => c.stages.find((s) => s.id === x.stageId)?.kind !== 'knockout') : [];
+  // The league's season: a player whose main and QYP clubs meet sits out unless the organisation allowed this match.
+  const season = c ? await seasonOf(c.orgId, c.season) : undefined;
+  // Season clubs are counted per person, across every player record they have (one per club, often).
+  const person = season ? await peopleOf(squadPlayerIds) : new Map<string, string>();
+  // A held squad place (not yet approved) isn't a club they can play for, so it doesn't make a clash.
+  const personRegs = season ? (await prisma.registration.findMany({ where: { playerId: { in: [...person.keys()] }, heldReason: null } })).map((r) => ({ ...toRegistration(r), playerId: person.get(r.playerId) ?? r.playerId })) : [];
+  const allowed = new Map((await prisma.clashAllowance.findMany({ where: { matchId: m.id } })).map((a) => [a.playerId, a.teamId]));
+  const teamNames = new Map((await prisma.team.findMany({ where: { id: { in: [...new Set(regs.map((r) => r.teamId))] } }, select: { id: true, shortName: true } })).map((t) => [t.id, t.shortName]));
+  const outsideSeason = (cs: ReturnType<typeof toCompetition>[]) => (season ? cs.filter((x) => !season.leagueIds.includes(x.id)) : cs);
   const out: MatchEligibility = { matchId: m.id, guestPlayersAllowed: c ? c.playerRules.guestPlayersPerXI : 11, knockout, teams: {} };
   for (const teamId of [m.homeTeamId, m.awayTeamId]) {
     const other = teamId === m.homeTeamId ? m.awayTeamId : m.homeTeamId;
@@ -155,7 +166,9 @@ export async function eligibilityFor(matchId: string): Promise<MatchEligibility>
       if (c) {
         const plays = clubWhenClubsMeet(playerId, c.id, [teamId, other], regs);
         if (plays && plays !== teamId) return { playerId, ok: false, reason: 'Plays for their first club when these clubs meet', appearances: apps };
-        const clash = otherLeagueConflicts(playerId, c, comps.map(toCompetition), regs)[0];
+        const seasonClash = season ? seasonClashReason({ playerId: person.get(playerId) ?? playerId, teamId, otherTeamId: other, season, regs: personRegs, allowedTeamId: allowed.get(playerId), teamName: (id) => teamNames.get(id) ?? 'their other club' }) : undefined;
+        if (seasonClash) return { playerId, ok: false, reason: seasonClash, appearances: apps };
+        const clash = otherLeagueConflicts(playerId, c, outsideSeason(comps.map(toCompetition)), regs)[0];
         if (clash) return { playerId, ok: false, reason: clash.reason, appearances: apps };
         const hold = regs.find((r) => r.competitionId === c.id && r.playerId === playerId && r.teamId === teamId && r.status === 'active' && r.heldReason);
         if (hold) return { playerId, ok: false, reason: `Held by the league's player rules: ${hold.heldReason}`, appearances: apps };

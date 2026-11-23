@@ -4,7 +4,7 @@
 
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import type { AdminMember, Competition, FixtureRequest, Organisation, SeasonProposal, Standings, User } from '@/api/types';
+import type { AdminMember, Competition, FixtureRequest, Organisation, SeasonProposal, SponsorBrand, SponsorReport, Standings, User } from '@/api/types';
 import type * as P from '~/generated/prisma/client';
 import { json, prisma, toJson } from '~/db/client';
 import { globalShares } from '~/lib/shares';
@@ -196,8 +196,60 @@ export async function adminRoutes(app: FastifyInstance) {
     const user = requireUser(req);
     if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can edit it');
     const b = z.object({ about: z.string().max(600).optional(), sponsors: z.array(z.string().trim().min(1)).max(12).optional(), brandColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(), executives: z.array(z.object({ name: z.string(), title: z.string() })).max(20).optional() }).parse(req.body);
-    const o = await prisma.organisation.update({ where: { id: req.params.id }, data: { ...(b.about !== undefined ? { about: b.about } : {}), ...(b.sponsors ? { sponsors: toJson(b.sponsors) } : {}), ...(b.brandColor ? { brandColor: b.brandColor } : {}), ...(b.executives ? { executives: toJson(b.executives) } : {}) } });
+    // Saving names only (older apps): keep the logos of sponsors still listed, add new names as partners.
+    let brands: SponsorBrand[] | undefined;
+    if (b.sponsors) {
+      const current = json<SponsorBrand[]>((await prisma.organisation.findUnique({ where: { id: req.params.id }, select: { sponsorBrands: true } }))?.sponsorBrands ?? []) ?? [];
+      brands = b.sponsors.map((name) => current.find((x) => x.name === name) ?? { id: newId('spn'), name, tier: 'partner' as const });
+    }
+    const o = await prisma.organisation.update({ where: { id: req.params.id }, data: { ...(b.about !== undefined ? { about: b.about } : {}), ...(b.sponsors ? { sponsors: toJson(b.sponsors), sponsorBrands: toJson(brands) } : {}), ...(b.brandColor ? { brandColor: b.brandColor } : {}), ...(b.executives ? { executives: toJson(b.executives) } : {}) } });
     return orgWithLinks(o);
+  });
+
+  // ------------------------------------------------------- stream sponsors
+  // Sponsors on the league's streams, with logos: one title sponsor always on screen, up to eight
+  // partners in turn. Their names are kept in `sponsors` too (title first) for everything that lists them.
+  app.put<{ Params: { id: string } }>('/organisations/:id/sponsor-brands', async (req) => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can change its sponsors');
+    const brand = z.object({ id: z.string().max(40).optional(), name: z.string().trim().min(1, 'Give each sponsor a name').max(60), logoUrl: z.string().url().max(500).optional(), tier: z.enum(['title', 'partner']) });
+    const { brands } = z.object({ brands: z.array(brand).max(9) }).parse(req.body);
+    if (brands.filter((b) => b.tier === 'title').length > 1) throw badRequest('There can be one title sponsor');
+    if (brands.filter((b) => b.tier === 'partner').length > 8) throw badRequest('Up to eight partners');
+    // Logos only from Ovalcast's own storage, so a stream never loads a picture from elsewhere.
+    if (brands.some((b) => b.logoUrl && !b.logoUrl.startsWith(storage.publicUrl('')))) throw badRequest('Upload each logo through Ovalcast');
+    const saved = brands.map((b) => ({ id: b.id || newId('spn'), name: b.name, ...(b.logoUrl ? { logoUrl: b.logoUrl } : {}), tier: b.tier })).sort((a, b) => (a.tier === b.tier ? 0 : a.tier === 'title' ? -1 : 1));
+    const o = await prisma.organisation.update({ where: { id: req.params.id }, data: { sponsorBrands: toJson(saved), sponsors: toJson(saved.map((b) => b.name)) } });
+    return orgWithLinks(o);
+  });
+
+  app.post<{ Params: { id: string } }>('/organisations/:id/sponsor-logo', async (req) => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can add sponsor logos');
+    const img = await readImage(req, `sponsor-${req.params.id}`);
+    return { url: img.url };
+  });
+
+  // What each sponsor got on the league's streams: streams carried, minutes on screen and views.
+  // The title sponsor is on screen for the whole stream; partners share it in turn.
+  app.get<{ Params: { id: string } }>('/organisations/:id/sponsor-report', async (req): Promise<SponsorReport> => {
+    const user = requireUser(req);
+    if (!isLeagueAdmin(user, req.params.id)) throw forbidden('Only the organisation’s admins can see the sponsor report');
+    const { days } = z.object({ days: z.coerce.number().int().min(1).max(366).default(30) }).parse(req.query);
+    const o = await prisma.organisation.findUnique({ where: { id: req.params.id }, select: { sponsorBrands: true } });
+    if (!o) throw notFound('Organisation');
+    const brands = json<SponsorBrand[]>(o.sponsorBrands) ?? [];
+    const streams = await prisma.stream.findMany({ where: { match: { competition: { orgId: req.params.id }, startsAt: { gte: new Date(Date.now() - days * 86_400_000) } } }, select: { liveSeconds: true, views: true } });
+    const liveMinutes = Math.round(streams.reduce((t, s) => t + s.liveSeconds, 0) / 60);
+    const views = streams.reduce((t, s) => t + s.views, 0);
+    const partners = brands.filter((b) => b.tier === 'partner').length;
+    return {
+      days,
+      streams: streams.length,
+      liveMinutes,
+      views,
+      sponsors: brands.map((b) => ({ id: b.id, name: b.name, tier: b.tier, ...(b.logoUrl ? { logoUrl: b.logoUrl } : {}), streams: streams.length, minutesOnScreen: b.tier === 'title' ? liveMinutes : partners ? Math.round(liveMinutes / partners) : 0, views })),
+    };
   });
 
   /** A logo or a cover picture, as a multipart image with a `kind` field. */

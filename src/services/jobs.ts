@@ -4,13 +4,14 @@
 //   npm run jobs   (once, by hand)
 
 import { confirmTransfers } from '~/routes/payouts';
+import { checkPictures } from '~/lib/streamPicture';
 import { sendMatchReminders } from './matchNews';
 import type { FastifyBaseLogger } from 'fastify';
 
 /** The API server's logger, or the worker's (scripts/worker.ts). */
 type JobLog = Pick<FastifyBaseLogger, 'info' | 'error'>;
 import { formatMoney, hostPayoutMinimum, type FinanceCurrency } from '@/engine';
-import { refundIfMostlyDown, walletCurrency } from '~/services/billing';
+import { refundIfMostlyDown, settleSmallStream, walletCurrency } from '~/services/billing';
 import { prisma } from '~/db/client';
 import { newId } from '~/lib/ids';
 import { withLock } from '~/lib/lock';
@@ -66,7 +67,11 @@ export async function refundDroppedStreams() {
   const ended = await prisma.stream.findMany({ where: { status: 'ended', refundedAt: null, downSeconds: { gt: 0 } }, select: { id: true } });
   let refunded = 0;
   for (const s of ended) if (await refundIfMostlyDown(s.id)) refunded += 1;
-  return { refunded };
+  // Streams that ended without the end button (a dead phone, a stale match): the small-stream rule still applies.
+  const unsettled = await prisma.stream.findMany({ where: { status: 'ended', platform: 'ovalcast', smallSettledAt: null }, select: { id: true } });
+  let small = 0;
+  for (const s of unsettled) if (await settleSmallStream(s.id)) small += 1;
+  return { refunded, small };
 }
 
 /** Accounts past their deletion date: personal data removed, match records kept without a name. */
@@ -145,5 +150,8 @@ export function startJobs(log: JobLog, everyMs = 3600_000) {
   // Withdrawals on their way: confirmed with Flutterwave even if its webhook never comes.
   const w = setInterval(() => void withLock('ovalcast:transfers', () => confirmTransfers()).then((x) => x?.checked && log.info(x, 'transfers confirmed')).catch((e) => log.error(e)), 5 * 60_000);
   w.unref();
-  return () => (clearInterval(t), clearInterval(r), clearInterval(w));
+  // Live streams: is the picture getting out? Every 20 seconds, for any streaming app.
+  const p = setInterval(() => void withLock('ovalcast:pictures', () => checkPictures()).catch((e) => log.error(e)), 20_000);
+  p.unref();
+  return () => (clearInterval(t), clearInterval(r), clearInterval(w), clearInterval(p));
 }

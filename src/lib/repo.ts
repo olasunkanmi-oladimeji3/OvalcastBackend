@@ -46,6 +46,7 @@ export const toOrg = (o: P.Organisation, competitionIds: string[], clubIds: stri
   founded: o.founded,
   executives: json(o.executives),
   sponsors: json(o.sponsors),
+  ...(json<unknown[]>(o.sponsorBrands)?.length ? { sponsorBrands: json(o.sponsorBrands) } : {}),
   honours: json(o.honours),
   seasonMoves: json(o.seasonMoves),
   competitionIds,
@@ -106,7 +107,8 @@ export const toCompetition = (c: P.Competition): Competition => ({
   entryFee: c.entryFee,
   maxTeams: c.maxTeams,
   startsOn: c.startsOn.toISOString(),
-  playerRules: json(c.playerRules),
+  // One club per player in a league, always; second clubs are the season's QYP places (lib/seasons).
+  playerRules: { ...json<Competition['playerRules']>(c.playerRules), multiClub: { allowed: false, maxClubs: 1 } },
   rulesDocument: json(c.rulesDocument) ?? undefined,
   seasonRules: json(c.seasonRules),
   category: c.category as Competition['category'],

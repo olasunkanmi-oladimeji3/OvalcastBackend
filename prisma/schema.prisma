@@ -154,6 +154,8 @@ model Organisation {
   founded           Int
   executives        Json      @default("[]")
   sponsors          Json      @default("[]")
+  /// Sponsors on streams: [{ id, name, logoUrl?, tier: title | partner }]. `sponsors` keeps their names, title first.
+  sponsorBrands     Json      @default("[]") @map("sponsor_brands")
   honours           Json      @default("[]")
   seasonMoves       Json      @default("[]") @map("season_moves")
   /// organisation (by contract) | free; without a contract, leagues use their admins' own plans.
@@ -571,6 +573,19 @@ model Stream {
   downSeconds    Int       @default(0) @map("down_seconds")
   /// Set when passes were refunded because the stream was down for over 30% of it.
   refundedAt     DateTime? @map("refunded_at") @db.Timestamptz
+  /// Whether the picture is reaching the video service: waiting (not started yet) | live | down. Checked by
+  /// the server for any streaming app, so downtime is measured fairly.
+  picture        String    @default("waiting")
+  /// When the picture last changed, when the server last checked it, and when the streamer and organiser were told it dropped.
+  pictureAt      DateTime? @map("picture_at") @db.Timestamptz
+  checkedAt      DateTime? @map("checked_at") @db.Timestamptz
+  downAlertedAt  DateTime? @map("down_alerted_at") @db.Timestamptz
+  /// A replay in parts when the stream dropped and reconnected: each part's address, in order.
+  replayParts    Json?     @map("replay_parts")
+  /// ovalcast (our video service; only when passes or viewer credits pay for it) | youtube (free, on the club's or league's channel).
+  platform       String    @default("ovalcast")
+  /// When the small-stream rule was checked at the end: under 10 paying viewers splits the match 50/50.
+  smallSettledAt DateTime? @map("small_settled_at") @db.Timestamptz
   match          Match     @relation(fields: [matchId], references: [id])
 
   @@index([matchId])
@@ -1022,6 +1037,8 @@ model TeamSheet {
   reserves        Json     @default("[]")
   captainId       String?  @map("captain_id")
   keeperId        String?  @map("keeper_id")
+  /// Vice-captain for this match: in the XI, not the captain.
+  viceCaptainId   String?  @map("vice_captain_id")
   submittedBy     String   @map("submitted_by")
   submittedByName String   @map("submitted_by_name")
   submittedAt     DateTime @default(now()) @map("submitted_at") @db.Timestamptz
@@ -1283,4 +1300,51 @@ model StreamView {
   @@index([at])
   @@index([streamId, viewer, at])
   @@map("stream_views")
+}
+
+/// An organisation's season (every one of its leagues with the same season label): its QYP rules.
+model OrgSeason {
+  orgId      String   @map("org_id")
+  season     String
+  /// A second club, in another league of the season, for players this age or under who the organisation approves.
+  qypEnabled Boolean  @default(false) @map("qyp_enabled")
+  qypMaxAge  Int      @default(23) @map("qyp_max_age")
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@id([orgId, season])
+  @@map("org_seasons")
+}
+
+/// A player asked (or approved) for a QYP place in a season: their main club and their second club.
+model SeasonQyp {
+  id          String    @id
+  orgId       String    @map("org_id")
+  season      String
+  /// The person (their account id, or the player record when there's no account).
+  playerId    String    @map("player_id")
+  mainTeamId  String    @map("main_team_id")
+  qypTeamId   String    @map("qyp_team_id")
+  /// pending | approved | declined
+  status      String
+  decidedBy   String?   @map("decided_by")
+  decidedAt   DateTime? @map("decided_at") @db.Timestamptz
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  @@unique([orgId, season, playerId])
+  @@index([orgId, season, status])
+  @@map("season_qyp")
+}
+
+/// The organisation lets a player play in one match between their main and QYP clubs, for one of them.
+model ClashAllowance {
+  id            String   @id
+  matchId       String   @map("match_id")
+  playerId      String   @map("player_id")
+  teamId        String   @map("team_id")
+  allowedBy     String   @map("allowed_by")
+  allowedByName String   @map("allowed_by_name")
+  at            DateTime @default(now()) @db.Timestamptz
+
+  @@unique([matchId, playerId])
+  @@map("clash_allowances")
 }

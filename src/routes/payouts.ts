@@ -25,8 +25,11 @@ const HOLD_MS = 24 * 3600_000;
 
 /** What a host is owed in each currency: their part of passes and donations, less payouts not refused. */
 export async function hostBalances(userId: string) {
+  // A match still streaming on Ovalcast isn't settled (the small-stream rule may change its split at the
+  // end), so its takings can't be withdrawn until the stream ends.
+  const live = (await prisma.stream.findMany({ where: { status: { not: 'ended' }, platform: 'ovalcast' }, select: { matchId: true } })).map((s) => s.matchId);
   const [sales, payouts] = await Promise.all([
-    prisma.passSale.groupBy({ by: ['currency'], where: { hostUserId: userId }, _sum: { host: true } }),
+    prisma.passSale.groupBy({ by: ['currency'], where: { hostUserId: userId, ...(live.length ? { matchId: { notIn: live } } : {}) }, _sum: { host: true } }),
     prisma.hostPayout.groupBy({ by: ['currency'], where: { userId, status: { not: 'failed' } }, _sum: { amount: true } }),
   ]);
   const fallback = await walletCurrency(userId);
