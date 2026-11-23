@@ -2,12 +2,12 @@
 // looking after the ground, coaching. Each aspect is 1 to 5 stars. A rating is for one
 // match, or overall (no match).
 
-export type RatedRole = 'player' | 'scorer' | 'umpire' | 'groundsman' | 'coach';
+export type RatedRole = 'player' | 'scorer' | 'umpire' | 'referee' | 'groundsman' | 'coach';
 
 /** The paths in the order profiles show them. */
-export const RATED_ROLES: RatedRole[] = ['player', 'scorer', 'umpire', 'groundsman', 'coach'];
+export const RATED_ROLES: RatedRole[] = ['player', 'scorer', 'umpire', 'referee', 'groundsman', 'coach'];
 
-export const RATED_LABEL: Record<RatedRole, string> = { player: 'Player', scorer: 'Scorer', umpire: 'Umpire', groundsman: 'Groundsman', coach: 'Coach' };
+export const RATED_LABEL: Record<RatedRole, string> = { player: 'Player', scorer: 'Scorer', umpire: 'Umpire', referee: 'Match referee', groundsman: 'Groundsman', coach: 'Coach' };
 
 export const RATING_ASPECTS: Record<RatedRole, { key: string; label: string }[]> = {
   player: [
@@ -26,6 +26,12 @@ export const RATING_ASPECTS: Record<RatedRole, { key: string; label: string }[]>
     { key: 'decisions', label: 'Good decisions' },
     { key: 'consistency', label: 'Consistent for both sides' },
     { key: 'control', label: 'Kept the game under control' },
+    { key: 'punctuality', label: 'On time and ready' },
+  ],
+  referee: [
+    { key: 'fairness', label: 'Fair to both sides' },
+    { key: 'management', label: 'Managed the match and the officials' },
+    { key: 'communication', label: 'Clear with captains' },
     { key: 'punctuality', label: 'On time and ready' },
   ],
   groundsman: [

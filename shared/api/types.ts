@@ -476,7 +476,7 @@ export interface Match {
   toss?: { wonByTeamId: ID; decision: 'bat' | 'bowl'; method: 'online' | 'manual'; at: ISODate };
   battingFirstTeamId?: ID;
   playingXI?: Record<ID, ID[]>;
-  officials: { /** Names on the scorecard: those with accounts first, in the order of `umpireUserIds`, then names only. */ umpires: string[]; umpireUserIds?: ID[]; scorerUserId?: ID; scorerName?: string; /** Who prepared the ground: names, and accounts where they have one. */ groundsmen?: string[]; groundsmanUserIds?: ID[]; /** Approved to stream, with their agreed part of the host share. */ streamers?: MatchStreamer[] };
+  officials: { /** Names on the scorecard: those with accounts first, in the order of `umpireUserIds`, then names only. */ umpires: string[]; umpireUserIds?: ID[]; scorerUserId?: ID; scorerName?: string; /** Who prepared the ground: names, and accounts where they have one. */ groundsmen?: string[]; groundsmanUserIds?: ID[]; /** League matches: the match referee. */ refereeUserId?: ID; refereeName?: string; /** Approved to stream, with their agreed part of the host share. */ streamers?: MatchStreamer[] };
   /** Who created a friendly; they and the clubs' admins can invite officials. */
   createdBy?: ID;
   /** Server-calculated summary, kept for lists and tables. */
@@ -624,7 +624,7 @@ export interface PayoutAccountInput {
   password: string;
 }
 
-export type OfficialRole = 'scorer' | 'umpire' | 'groundsman' | 'coach';
+export type OfficialRole = 'scorer' | 'umpire' | 'referee' | 'groundsman' | 'coach';
 export type Weekday = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun';
 
 export interface Certificate {
@@ -669,7 +669,7 @@ export interface PersonProfile {
   clubIds: ID[];
   officiating: OfficiatingProfile;
   /** Each path's record: matches played, scored, umpired, grounds prepared, and coached. */
-  stats: { scored: number; umpired: number; played: number; coached: number; groundsman: number };
+  stats: { scored: number; umpired: number; refereed?: number; played: number; coached: number; groundsman: number };
   scored: Match[];
   umpired: Match[];
   /** Matches whose ground they prepared. */
@@ -713,6 +713,29 @@ export interface RatingSummary {
   /** How many were for a match, and how many overall. */
   byMatch: number;
   overall: number;
+}
+
+/** After a league match: each captain's review of the officials (due within 48 hours) and the referee's report. */
+export interface MatchReviews {
+  matchId: ID;
+  /** A league match still without a match referee. */
+  needsReferee: boolean;
+  /** Officials with accounts the captains review (umpires and the referee). */
+  officialsToReview: number;
+  captains: { teamId: ID; userId?: ID; name?: string; done: boolean; dueBy?: ISODate; overdue: boolean; mine: boolean }[];
+  referee?: { userId: ID; name: string; reported: boolean; dueBy?: ISODate; overdue: boolean; mine: boolean };
+  /** The referee's report: shown to the league and the referee. */
+  report?: RefereeReport & { by: string; at: ISODate };
+}
+
+/** The match referee's report to the league. */
+export interface RefereeReport {
+  /** Each side's conduct, 1 to 5, by team id. */
+  conduct: Record<ID, number>;
+  /** The pitch, 1 to 5. */
+  pitch: number;
+  incidents: string;
+  reported: { name: string; teamId?: ID; note: string }[];
 }
 
 /** An organisation's season: its leagues with the same season label, and its QYP rules. */
@@ -759,7 +782,7 @@ export interface SponsorReport {
 /** One official at a match, with how they're rated in that job: overall, for this match, and whether you can rate them for it. */
 export interface MatchOfficialRating {
   userId: ID;
-  role: 'scorer' | 'umpire' | 'groundsman';
+  role: 'scorer' | 'umpire' | 'referee' | 'groundsman';
   name: string;
   overall?: { average: number; count: number };
   thisMatch?: { average: number; count: number };
@@ -801,7 +824,7 @@ export interface OfficialInvite {
   matchId: ID;
   userId: ID;
   userName: string;
-  role: 'scorer' | 'umpire' | 'groundsman' | 'streamer';
+  role: 'scorer' | 'referee' | 'umpire' | 'groundsman' | 'streamer';
   /** invite: the organiser asked them. request: they asked to stream and the organiser answers. */
   kind?: 'invite' | 'request';
   /** Streamers: the agreed part of the host share (0.4 = 40%). */
@@ -1807,7 +1830,7 @@ export interface OvalcastApi {
   listOfficials(params: { regionId?: ID; role?: OfficialRole; availableOnly?: boolean; date?: string; minRating?: number }): Promise<PersonProfile[]>;
 
   // POST /matches/:id/officials/invite , GET /matches/:id/officials/invites , GET /me/official-invites , POST /official-invites/:id/respond
-  inviteOfficial(matchId: ID, userId: ID, role: 'scorer' | 'umpire' | 'groundsman', note?: string): Promise<OfficialInvite>;
+  inviteOfficial(matchId: ID, userId: ID, role: 'scorer' | 'umpire' | 'referee' | 'groundsman', note?: string): Promise<OfficialInvite>;
   // POST /matches/:id/setup  (organisers: the ground, date, home side and every official at once)
   setUpMatch(matchId: ID, input: MatchSetupInput): Promise<{ match: Match; invites: OfficialInvite[] }>;
   listMatchOfficialInvites(matchId: ID): Promise<OfficialInvite[]>;
@@ -1942,6 +1965,9 @@ export interface OvalcastApi {
   // PUT /organisations/:id/sponsor-brands , POST /organisations/:id/sponsor-logo , GET /organisations/:id/sponsor-report
   // Seasons: GET /organisations/:id/seasons , PUT /organisations/:id/season , GET /organisations/:id/season/qyp?season= , POST /season-qyp/:id
   listSeasons(orgId: ID): Promise<OrgSeasonView[]>;
+  // GET /matches/:id/reviews , PUT /matches/:id/referee-report
+  getMatchReviews(matchId: ID): Promise<MatchReviews>;
+  fileRefereeReport(matchId: ID, report: RefereeReport): Promise<{ ok: true }>;
   setSeasonRules(orgId: ID, season: string, rules: { qypEnabled: boolean; qypMaxAge: number }): Promise<OrgSeasonView>;
   listSeasonQyp(orgId: ID, season: string): Promise<SeasonQypRequest[]>;
   decideQyp(requestId: ID, decision: 'approve' | 'decline', swap?: boolean): Promise<{ ok: true }>;

@@ -452,7 +452,7 @@ export async function matchRoutes(app: FastifyInstance) {
   // ----------------------------------------------------- officials invites
   app.post<{ Params: { id: string } }>('/matches/:id/officials/invite', async (req) => {
     const user = requireUser(req);
-    const { userId, role, note } = z.object({ userId: z.string(), role: z.enum(['scorer', 'umpire', 'groundsman']), note: z.string().optional() }).parse(req.body);
+    const { userId, role, note } = z.object({ userId: z.string(), role: z.enum(['scorer', 'umpire', 'referee', 'groundsman']), note: z.string().optional() }).parse(req.body);
     const m = await getMatch(req.params.id);
     if (!(await canManageOfficials(user, m))) throw forbidden(m.competitionId ? 'Only a league admin can appoint officials for league matches' : 'Only the person who set up this friendly, or a club admin, can invite officials');
     if (m.status === 'completed') throw conflict('This match has finished');
@@ -461,12 +461,14 @@ export async function matchRoutes(app: FastifyInstance) {
     if (role === 'scorer' && m.officials.scorerUserId === userId) throw conflict(`${invitee.name} is already the scorer`);
     if (role === 'umpire' && (m.officials.umpireUserIds?.length ?? 0) >= 2) throw conflict('This match already has two umpires');
     if (role === 'groundsman' && m.officials.groundsmanUserIds?.includes(userId)) throw conflict(`${invitee.name} is already preparing the ground`);
+    if (role === 'referee' && !m.competitionId) throw badRequest('Match referees are for league matches');
+    if (role === 'referee' && m.officials.refereeUserId) throw conflict(`${m.officials.refereeName ?? 'Someone'} is already the match referee`);
     const pending = await prisma.officialInvite.count({ where: { matchId: m.id, userId, role, status: 'pending' } });
     if (pending) throw conflict(`${invitee.name} already has an invitation`);
     const inv = await prisma.officialInvite.create({ data: { id: newId('oinv'), matchId: m.id, userId, userName: invitee.name, role, invitedBy: user.id, invitedByName: user.name, status: 'pending', note: note ?? null } });
     const names = await prisma.team.findMany({ where: { id: { in: [m.homeTeamId, m.awayTeamId] } }, select: { id: true, name: true } });
     const n = (id: string) => names.find((t) => t.id === id)?.name;
-    await notify(userId, { kind: 'official', title: `${user.name} invited you to ${role === 'scorer' ? 'score' : role === 'groundsman' ? 'prepare the ground' : 'umpire'}`, body: `${n(m.homeTeamId)} v ${n(m.awayTeamId)}, ${m.venue}. Accept or decline on the match.`, link: { pathname: '/match/[id]', params: { id: m.id } } });
+    await notify(userId, { kind: 'official', title: `${user.name} invited you to ${role === 'scorer' ? 'score' : role === 'groundsman' ? 'prepare the ground' : role === 'referee' ? 'be the match referee' : 'umpire'}`, body: `${n(m.homeTeamId)} v ${n(m.awayTeamId)}, ${m.venue}. Accept or decline on the match.`, link: { pathname: '/match/[id]', params: { id: m.id } } });
     return toInvite(inv);
   });
 
@@ -647,6 +649,10 @@ export async function matchRoutes(app: FastifyInstance) {
       if (inv.role === 'scorer') {
         m.officials = { ...m.officials, scorerUserId: user.id, scorerName: user.name };
         await prisma.officialInvite.updateMany({ where: { matchId: m.id, role: 'scorer', status: 'pending' }, data: { status: 'withdrawn' } });
+      } else if (inv.role === 'referee') {
+        // One match referee, for league matches; other referee invitations are withdrawn.
+        m.officials = { ...m.officials, refereeUserId: user.id, refereeName: user.name };
+        await prisma.officialInvite.updateMany({ where: { matchId: m.id, role: 'referee', status: 'pending' }, data: { status: 'withdrawn' } });
       } else if (inv.role === 'groundsman') {
         // Whoever prepares the ground: up to two.
         const short = `${user.name.split(' ')[0][0]}. ${user.name.split(' ').at(-1)}`;
@@ -657,7 +663,7 @@ export async function matchRoutes(app: FastifyInstance) {
       }
       await saveMatch(m);
     }
-    const doing = inv.role === 'scorer' ? 'score' : inv.role === 'groundsman' ? 'prepare the ground for' : 'umpire';
+    const doing = inv.role === 'scorer' ? 'score' : inv.role === 'groundsman' ? 'prepare the ground for' : inv.role === 'referee' ? 'be the match referee for' : 'umpire';
     await notify(inv.invitedBy, { kind: 'official', title: `${user.name} ${status === 'accepted' ? 'will' : 'can’t'} ${doing} your match`, body: status === 'accepted' ? 'They are now listed on the match.' : 'Invite someone else from Find officials.', link: { pathname: '/match/[id]', params: { id: m.id } } });
     return toInvite(saved);
   });

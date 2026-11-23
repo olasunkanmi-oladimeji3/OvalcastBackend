@@ -15,14 +15,14 @@ import { storage } from '~/lib/storage';
 import { aggregate, replayedMatches } from '~/services/stats';
 import { getMatch } from '~/services/matches';
 
-const ROLES = ['scorer', 'umpire', 'groundsman', 'coach'] as const;
+const ROLES = ['scorer', 'umpire', 'referee', 'groundsman', 'coach'] as const;
 const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const;
 type Officiating = Omit<OfficiatingProfile, 'certificates'>;
 const emptyOfficiating: Officiating = { roles: [], available: false, days: [], travelKm: 20, bio: '', grounds: [] };
 const officiatingOf = (u: P.User): Officiating => ({ ...emptyOfficiating, ...json<Officiating | null>(u.officiating) });
 const ACTIVE = ['completed', 'live', 'inningsBreak'];
 
-const RATED = ['player', 'scorer', 'umpire', 'groundsman', 'coach'] as const;
+const RATED = ['player', 'scorer', 'umpire', 'referee', 'groundsman', 'coach'] as const;
 type Rated = (typeof RATED)[number];
 
 /** Everyone already appointed (scorer, umpire, groundsman) to a match starting on this date (UTC). */
@@ -32,8 +32,8 @@ async function bookedOn(date: string) {
   const matches = await prisma.match.findMany({ where: { startsAt: { gte: from, lt: to }, status: { notIn: ['abandoned', 'cancelled'] } }, select: { officials: true } });
   const ids = new Set<string>();
   for (const m of matches) {
-    const o = json<{ scorerUserId?: string; umpireUserIds?: string[]; groundsmanUserIds?: string[] }>(m.officials);
-    for (const id of [o.scorerUserId, ...(o.umpireUserIds ?? []), ...(o.groundsmanUserIds ?? [])]) if (id) ids.add(id);
+    const o = json<{ scorerUserId?: string; umpireUserIds?: string[]; groundsmanUserIds?: string[]; refereeUserId?: string }>(m.officials);
+    for (const id of [o.scorerUserId, o.refereeUserId, ...(o.umpireUserIds ?? []), ...(o.groundsmanUserIds ?? [])]) if (id) ids.add(id);
   }
   return ids;
 }
@@ -50,16 +50,18 @@ function partOfMatch(viewer: User, m: Match, orgId?: string) {
     (!!viewer.playerId && xi.includes(viewer.playerId)) ||
     o.scorerUserId === viewer.id ||
     !!o.umpireUserIds?.includes(viewer.id) ||
-    !!o.groundsmanUserIds?.includes(viewer.id)
+    !!o.groundsmanUserIds?.includes(viewer.id) ||
+    o.refereeUserId === viewer.id
   );
 }
 
 /** Who officiated a match, by role: only people with an Ovalcast account can be rated. */
-function officialsOf(m: Match): { userId: string; role: 'scorer' | 'umpire' | 'groundsman'; name: string }[] {
+function officialsOf(m: Match): { userId: string; role: 'scorer' | 'umpire' | 'referee' | 'groundsman'; name: string }[] {
   const o = m.officials;
   return [
     ...(o.scorerUserId ? [{ userId: o.scorerUserId, role: 'scorer' as const, name: o.scorerName ?? 'Scorer' }] : []),
     ...(o.umpireUserIds ?? []).map((id, i) => ({ userId: id, role: 'umpire' as const, name: o.umpires[i] ?? 'Umpire' })),
+    ...(o.refereeUserId ? [{ userId: o.refereeUserId, role: 'referee' as const, name: o.refereeName ?? 'Match referee' }] : []),
     ...(o.groundsmanUserIds ?? []).map((id, i) => ({ userId: id, role: 'groundsman' as const, name: o.groundsmen?.[i] ?? 'Groundsman' })),
   ].filter((x) => !!x.userId);
 }
@@ -124,7 +126,7 @@ async function rateableBy(u: P.User, viewer: User | undefined, paths: Partial<Re
 }
 
 async function person(u: P.User, opts: { withMatches: boolean; played?: Map<string, number>; viewer?: User }): Promise<PersonProfile> {
-  const [certs, regions, memberships, scored, umpired, prepared, teams] = await Promise.all([
+  const [certs, regions, memberships, scored, umpired, prepared, teams, refereed] = await Promise.all([
     prisma.certificate.findMany({ where: { userId: u.id }, orderBy: { uploadedAt: 'desc' } }),
     prisma.region.findMany(),
     prisma.membership.findMany({ where: { userId: u.id } }),
@@ -132,6 +134,7 @@ async function person(u: P.User, opts: { withMatches: boolean; played?: Map<stri
     matchIdsWithOfficial('umpireUserIds', u.id).then((ids) => prisma.match.findMany({ where: { id: { in: ids }, status: { in: ACTIVE } }, orderBy: { startsAt: 'desc' } })),
     matchIdsWithOfficial('groundsmanUserIds', u.id).then((ids) => prisma.match.findMany({ where: { id: { in: ids }, status: { in: ACTIVE } }, orderBy: { startsAt: 'desc' } })),
     prisma.team.findMany({ where: { staff: { array_contains: [{ userId: u.id, role: 'coach' }] } }, select: { id: true, staff: true } }),
+    prisma.$queryRaw<{ id: string }[]>`select id from matches where officials @> ${JSON.stringify({ refereeUserId: u.id })}::jsonb`.then((rows) => prisma.match.findMany({ where: { id: { in: rows.map((r) => r.id) }, status: { in: ACTIVE } }, orderBy: { startsAt: 'desc' } })),
   ]);
   const coachedIds = teams.filter((t) => json<StaffMember[]>(t.staff).some((s) => s.userId === u.id && s.role === 'coach')).map((t) => t.id);
   const coached = coachedIds.length ? await prisma.match.count({ where: { status: 'completed', OR: [{ homeTeamId: { in: coachedIds } }, { awayTeamId: { in: coachedIds } }] } }) : 0;
@@ -151,14 +154,14 @@ async function person(u: P.User, opts: { withMatches: boolean; played?: Map<stri
     playerId: u.playerId ?? undefined,
     clubIds: [...new Set([...memberships.filter((m) => m.clubId).map((m) => m.clubId!), ...coachedIds])],
     officiating,
-    stats: { scored: scored.length, umpired: umpired.length, played, coached, groundsman: prepared.length },
+    stats: { scored: scored.length, umpired: umpired.length, refereed: refereed.length, played, coached, groundsman: prepared.length },
     scored: opts.withMatches ? scored.slice(0, 10).map(toMatch) : [],
     umpired: opts.withMatches ? umpired.slice(0, 10).map(toMatch) : [],
     prepared: opts.withMatches ? prepared.slice(0, 10).map(toMatch) : [],
     memberSince: u.createdAt.toISOString(),
     playing: json<PersonProfile['playing'] | null>(u.playing) ?? undefined,
     ratings: await ratingSummaries(u.id),
-    rateable: opts.withMatches ? await rateableBy(u, opts.viewer, { player: playedIn, scorer: scored.map(toMatch), umpire: umpired.map(toMatch), groundsman: prepared.map(toMatch) }) : [],
+    rateable: opts.withMatches ? await rateableBy(u, opts.viewer, { player: playedIn, scorer: scored.map(toMatch), umpire: umpired.map(toMatch), referee: refereed.map(toMatch), groundsman: prepared.map(toMatch) }) : [],
   };
 }
 
@@ -176,7 +179,7 @@ export async function peopleRoutes(app: FastifyInstance) {
     const m = await getMatch(req.params.id);
     const list = officialsOf(m);
     if (!list.length) return [];
-    const rows = await prisma.rating.findMany({ where: { userId: { in: list.map((x) => x.userId) }, role: { in: ['scorer', 'umpire', 'groundsman'] } }, select: { userId: true, role: true, matchId: true, raterId: true, scores: true } });
+    const rows = await prisma.rating.findMany({ where: { userId: { in: list.map((x) => x.userId) }, role: { in: ['scorer', 'umpire', 'referee', 'groundsman'] } }, select: { userId: true, role: true, matchId: true, raterId: true, scores: true } });
     const viewer = req.user;
     const orgId = m.competitionId ? (await prisma.competition.findUnique({ where: { id: m.competitionId }, select: { orgId: true } }))?.orgId : undefined;
     const mayRate = !!viewer && m.status === 'completed' && partOfMatch(viewer, m, orgId);

@@ -1348,3 +1348,40 @@ model ClashAllowance {
   @@unique([matchId, playerId])
   @@map("clash_allowances")
 }
+
+/// The match referee's report to the league after a league match.
+model RefereeReport {
+  matchId     String   @id @map("match_id")
+  refereeId   String   @map("referee_id")
+  refereeName String   @map("referee_name")
+  /// Each side's conduct, 1 to 5, by team id.
+  conduct     Json
+  /// The pitch, 1 to 5.
+  pitch       Int
+  incidents   String   @default("")
+  /// Players or officials reported: [{ name, teamId?, note }].
+  reported    Json     @default("[]")
+  submittedAt DateTime @default(now()) @map("submitted_at") @db.Timestamptz
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("referee_reports")
+}
+
+/// After a league match, each side's captain reviews the officials within 48 hours (and the referee
+/// files a report): when they were asked, reminded, and flagged to the league.
+model MatchReviewDue {
+  id         String    @id
+  matchId    String    @map("match_id")
+  /// captain (a side's captain, by teamId) | referee (the match report)
+  kind       String
+  teamId     String?   @map("team_id")
+  userId     String    @map("user_id")
+  askedAt    DateTime  @default(now()) @map("asked_at") @db.Timestamptz
+  remindedAt DateTime? @map("reminded_at") @db.Timestamptz
+  flaggedAt  DateTime? @map("flagged_at") @db.Timestamptz
+  doneAt     DateTime? @map("done_at") @db.Timestamptz
+
+  @@unique([matchId, kind, userId])
+  @@index([doneAt, askedAt])
+  @@map("match_reviews_due")
+}

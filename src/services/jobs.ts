@@ -5,6 +5,7 @@
 
 import { confirmTransfers } from '~/routes/payouts';
 import { checkPictures } from '~/lib/streamPicture';
+import { runReviewChecks } from '~/lib/matchReviews';
 import { sendMatchReminders } from './matchNews';
 import type { FastifyBaseLogger } from 'fastify';
 
@@ -150,8 +151,11 @@ export function startJobs(log: JobLog, everyMs = 3600_000) {
   // Withdrawals on their way: confirmed with Flutterwave even if its webhook never comes.
   const w = setInterval(() => void withLock('ovalcast:transfers', () => confirmTransfers()).then((x) => x?.checked && log.info(x, 'transfers confirmed')).catch((e) => log.error(e)), 5 * 60_000);
   w.unref();
+  // After league matches: captains' reviews and referees' reports, asked, reminded at 24 hours, flagged at 48.
+  const v = setInterval(() => void withLock('ovalcast:reviews', () => runReviewChecks()).catch((e) => log.error(e)), 5 * 60_000);
+  v.unref();
   // Live streams: is the picture getting out? Every 20 seconds, for any streaming app.
   const p = setInterval(() => void withLock('ovalcast:pictures', () => checkPictures()).catch((e) => log.error(e)), 20_000);
   p.unref();
-  return () => (clearInterval(t), clearInterval(r), clearInterval(w), clearInterval(p));
+  return () => (clearInterval(t), clearInterval(r), clearInterval(w), clearInterval(p), clearInterval(v));
 }
