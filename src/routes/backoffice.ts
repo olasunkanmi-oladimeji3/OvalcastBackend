@@ -213,6 +213,7 @@ const ACTION: Record<string, string> = {
   revokeEmbeds: 'switched website embeds off',
   markPayoutPaid: 'marked a withdrawal paid by hand',
   ovalcastSettlement: 'recorded money moved to Ovalcast’s bank',
+  mergeClubs: 'merged a duplicate club',
 };
 
 async function actionRows(where: P.Prisma.StaffActionWhereInput, take = 30): Promise<StaffActionRow[]> {

@@ -1967,6 +1967,9 @@ export interface OvalcastApi {
   listSeasons(orgId: ID): Promise<OrgSeasonView[]>;
   // GET /matches/:id/reviews , PUT /matches/:id/referee-report
   getMatchReviews(matchId: ID): Promise<MatchReviews>;
+  /** Staff: merging a duplicate club into the one kept (GET /staff/clubs/merge-preview, POST /staff/clubs/merge). */
+  staffMergePreview(keepId: ID, mergeId: ID): Promise<{ keep: { id: ID; name: string; city: string }; merge: { id: ID; name: string; city: string; adHoc: boolean }; moves: { players: number; matches: number; entries: number; members: number }; problem?: string }>;
+  staffMergeClubs(keepId: ID, mergeId: ID, note: string): Promise<{ ok: true; keptId: ID }>;
   fileRefereeReport(matchId: ID, report: RefereeReport): Promise<{ ok: true }>;
   setSeasonRules(orgId: ID, season: string, rules: { qypEnabled: boolean; qypMaxAge: number }): Promise<OrgSeasonView>;
   listSeasonQyp(orgId: ID, season: string): Promise<SeasonQypRequest[]>;

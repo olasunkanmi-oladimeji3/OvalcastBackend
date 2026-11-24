@@ -13,3 +13,4 @@ export * from './rain';
 export * from './access';
 export * from './ratings';
 export * from './decisions';
+export * from './clubs';
